@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "mdr-process"
-version = "0.41.1"
+version = "0.41.3"
 dependencies = [
  "anyhow",
  "assert_cmd",

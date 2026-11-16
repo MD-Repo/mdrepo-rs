@@ -43,7 +43,9 @@ pub struct PdbAtom {
     pub resid: String,
     pub segid: String,
     pub element: String,
-    pub xyz: [f64; 3],
+    /// None where a coordinate does not parse, such as an overflowed
+    /// `********` field; such an atom's bonds are not measured
+    pub xyz: Option<[f64; 3]>,
 }
 
 /// What a written psf holds
@@ -160,7 +162,7 @@ pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
         }
         let col =
             |a: usize, b: usize| line.get(a..b.min(line.len())).unwrap_or("").trim();
-        let coord = |a: usize, b: usize| col(a, b).parse::<f64>().unwrap_or(0.0);
+        let coord = |a: usize, b: usize| col(a, b).parse::<f64>().ok();
         let name = col(12, 16).to_string();
         let chain = col(21, 22);
         // A blank chain column: its TER block, set below once the whole
@@ -178,7 +180,10 @@ pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
             resname: col(16, 21).to_string(),
             resid: col(22, 27).to_string(),
             segid,
-            xyz: [coord(30, 38), coord(38, 46), coord(46, 54)],
+            xyz: match (coord(30, 38), coord(38, 46), coord(46, 54)) {
+                (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                _ => None,
+            },
         });
         block_has_atoms = true;
     }
@@ -418,7 +423,10 @@ fn count_long(atoms: &[PdbAtom], bonds: &[(usize, usize)]) -> usize {
     bonds
         .iter()
         .filter(|&&(i, j)| {
-            let (a, b) = (atoms[i].xyz, atoms[j].xyz);
+            // A position read as 0.0 made every bond to it look long
+            let (Some(a), Some(b)) = (atoms[i].xyz, atoms[j].xyz) else {
+                return false;
+            };
             let d2: f64 = (0..3).map(|k| (a[k] - b[k]).powi(2)).sum();
             d2.sqrt() > LONG_BOND
         })
@@ -618,6 +626,17 @@ mod tests {
         let atoms = read_pdb(&blank_chain_pdb());
         // N(0) to N(10): a 10 A "bond"
         assert_eq!(count_long(&atoms, &[(0, 1), (0, 2)]), 1);
+    }
+
+    #[test]
+    fn a_bond_to_an_overflowed_position_is_not_counted_long() {
+        // Read as 0.0, the `********` atom sat 50 A from its neighbour and
+        // every bond to it counted as long (mdrepo-rs#89)
+        let mut overflowed = atom(2, "CA", "ALA", 'A', 2, "C", 0.0);
+        overflowed.replace_range(30..38, "********");
+        let atoms = read_pdb(&(atom(1, "CA", "ALA", 'A', 1, "C", 50.0) + &overflowed));
+        assert_eq!(atoms[1].xyz, None);
+        assert_eq!(count_long(&atoms, &[(0, 1)]), 0);
     }
 
     #[test]

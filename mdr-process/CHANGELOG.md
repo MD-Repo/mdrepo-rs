@@ -11,6 +11,20 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   database or iRODS, or in its command line;
 - **patch** (0.2.0 -> 0.2.1) for everything else.
 
+## 0.41.3 (unreleased)
+
+- **An overflowed PDB coordinate (`********`) no longer fails the import.**
+  A writer fills an 8.3f field it cannot fit (below -999.999 or above
+  9999.999) with asterisks. Sequence extraction parsed every coordinate and
+  stopped at the first that failed: zenodo:13880099's unwrapped
+  center-of-mass beads, in an 1880 A cell, failed `process` this way
+  (#89). Such an atom now keeps its place in the sequence with its
+  position unknown, so the chain-break test falls back to the numbering as
+  for a bead with nothing to measure. Any other unparseable coordinate is
+  still an error. The psf writer read one as 0.0 and counted every bond to
+  it as long; it now leaves those bonds out of the count. The mmCIF writer
+  still reads one as 0.0 and is not changed here.
+
 ## 0.41.0 (unreleased)
 
 - **New output check, `solute`: minimal must keep every residue full has**

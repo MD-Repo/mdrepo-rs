@@ -159,6 +159,9 @@ enum Kind {
 }
 
 // --------------------------------------------------
+/// A position, None where it could not be read
+type Pos = Option<[f64; 3]>;
+
 /// One residue as it appears in the file, with the atoms the rules need
 #[derive(Debug)]
 struct Residue {
@@ -169,11 +172,14 @@ struct Residue {
     ins_code: char,
     name: String,
     num_atoms: usize,
-    n: Option<[f64; 3]>,
-    ca: Option<[f64; 3]>,
-    c: Option<[f64; 3]>,
-    p: Option<[f64; 3]>,
-    o3: Option<[f64; 3]>,
+    /// Each backbone atom when present, with its position when known. The
+    /// two are kept apart: an overflowed coordinate (mdrepo-rs#89) loses the
+    /// position, not the atom, and a CA bead still makes an amino acid.
+    n: Option<Pos>,
+    ca: Option<Pos>,
+    c: Option<Pos>,
+    p: Option<Pos>,
+    o3: Option<Pos>,
     has_o2: bool,
     has_sugar: bool,
     /// The 5'-terminal hydroxyl hydrogen (H5T, HO5') and the 3' one (H3T,
@@ -417,7 +423,8 @@ struct PdbAtom {
     chain_id: String,
     res_seq: i32,
     ins_code: char,
-    xyz: [f64; 3],
+    /// None where a coordinate overflowed its column (`********`)
+    xyz: Option<[f64; 3]>,
     /// Columns 77-78, or the leading letters of the atom name when blank
     element: String,
 }
@@ -433,8 +440,17 @@ fn read_atoms(text: &str) -> Result<Vec<PdbAtom>> {
             continue;
         }
         let col = |a: usize, b: usize| line.get(a..b.min(line.len())).unwrap_or("");
-        let num = |a: usize, b: usize| -> Result<f64> {
-            col(a, b).trim().parse::<f64>().map_err(|e| {
+        // A writer fills an 8.3f field it cannot fit (below -999.999 or above
+        // 9999.999) with asterisks: the position is lost, not malformed.
+        // zenodo:13880099's center-of-mass beads, unwrapped across an 1880 A
+        // cell, failed the whole import here (mdrepo-rs#89). Anything else
+        // that does not parse is still an error.
+        let num = |a: usize, b: usize| -> Result<Option<f64>> {
+            let field = col(a, b).trim();
+            if !field.is_empty() && field.chars().all(|c| c == '*') {
+                return Ok(None);
+            }
+            field.parse::<f64>().map(Some).map_err(|e| {
                 anyhow!("line {}: columns {}-{}: {e}: {line:?}", i + 1, a + 1, b)
             })
         };
@@ -461,7 +477,10 @@ fn read_atoms(text: &str) -> Result<Vec<PdbAtom>> {
             chain_id: col(21, 22).trim().to_string(),
             res_seq,
             ins_code: col(26, 27).chars().next().unwrap_or(' '),
-            xyz: [num(30, 38)?, num(38, 46)?, num(46, 54)?],
+            xyz: match (num(30, 38)?, num(38, 46)?, num(46, 54)?) {
+                (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                _ => None,
+            },
         });
     }
     Ok(atoms)
@@ -530,7 +549,7 @@ fn joins(cell: Option<&Cell>, prev: &Residue, cur: &Residue) -> bool {
     if backbone_present(prev, cur) {
         return false;
     }
-    match (prev.ca, cur.ca) {
+    match (prev.ca.flatten(), cur.ca.flatten()) {
         (Some(a), Some(b)) => distance_in(cell, a, b) <= MAX_CA_CA,
         _ => true,
     }
@@ -538,17 +557,19 @@ fn joins(cell: Option<&Cell>, prev: &Residue, cur: &Residue) -> bool {
 
 /// C(i) to N(i+1), or O3'(i) to P(i+1), within `MAX_BACKBONE_BOND`
 fn backbone_bonded(cell: Option<&Cell>, prev: &Residue, cur: &Residue) -> bool {
-    let bonded = |a: Option<[f64; 3]>, b: Option<[f64; 3]>| match (a, b) {
+    let bonded = |a: Option<Pos>, b: Option<Pos>| match (a.flatten(), b.flatten()) {
         (Some(a), Some(b)) => distance_in(cell, a, b) <= MAX_BACKBONE_BOND,
         _ => false,
     };
     bonded(prev.c, cur.n) || bonded(prev.o3, cur.p)
 }
 
-/// Both residues have the atoms of a backbone bond, so whether they are
-/// bonded can be measured
+/// Both residues have the atoms of a backbone bond, at known positions, so
+/// whether they are bonded can be measured
 fn backbone_present(prev: &Residue, cur: &Residue) -> bool {
-    (prev.c.is_some() && cur.n.is_some()) || (prev.o3.is_some() && cur.p.is_some())
+    let known =
+        |a: Option<Pos>, b: Option<Pos>| a.flatten().is_some() && b.flatten().is_some();
+    known(prev.c, cur.n) || known(prev.o3, cur.p)
 }
 
 fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -1744,6 +1765,37 @@ mod tests {
         let mut s = 0;
         let got = chains(&chain(&mut s, "MET ALA GLY SER", "A", 1, 0.0));
         assert_eq!(got[0].breaks, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn an_overflowed_coordinate_is_an_unknown_position() {
+        // zenodo:13880099 (mdrepo-rs#89): center-of-mass beads unwrapped
+        // across an 1880 A cell, and a z the writer could not fit filled
+        // with asterisks. The bead reads as unplaced and the numbering
+        // decides, as for a bead with no position at all.
+        let mut lines: Vec<String> = ["MET", "ALA", "LYS"]
+            .iter()
+            .enumerate()
+            .map(|(i, res)| {
+                atom(
+                    i as i32 + 1,
+                    "CA",
+                    res,
+                    " ",
+                    i as i32 + 1,
+                    [3.8 * i as f64, 0.0, 0.0],
+                )
+            })
+            .collect();
+        lines[1].replace_range(46..54, "********");
+        assert_eq!(fasta(&lines), ">_\nMAK\n");
+    }
+
+    #[test]
+    fn a_malformed_coordinate_is_still_an_error() {
+        let mut line = atom(1, "CA", "MET", " ", 1, [0.0, 0.0, 0.0]);
+        line.replace_range(46..54, "  12.3ab");
+        assert!(chains_from_text(&(line + "\nEND\n")).is_err());
     }
 
     #[test]
