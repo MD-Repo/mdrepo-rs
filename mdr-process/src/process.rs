@@ -31,7 +31,7 @@ use std::{
     io::{Read, Write},
     os::unix::process::CommandExt,
     path::{self, Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{self, Instant},
 };
@@ -4251,11 +4251,11 @@ fn run_helper(cmd: &mut Command, what: &str) -> Result<()> {
 // --------------------------------------------------
 /// `Command::output`, but giving up after `limit` and returning `None`.
 ///
-/// The child gets a process group of its own and the whole group is killed:
-/// the cpptraj wrapper treats a dead `cpptraj` as non-fatal and hangs again
-/// at its next stage, so killing only one of them never ends the job. The
-/// cost is that a Ctrl-C at the terminal no longer reaches the group; stop a
-/// manual run's conversion by its group id (`kill -- -<pgid>`).
+/// The child gets a process group of its own and the whole group is stopped
+/// (`stop_group`): the cpptraj wrapper treats a dead `cpptraj` as non-fatal
+/// and hangs again at its next stage, so stopping only one of them never ends
+/// the job. The cost is that a Ctrl-C at the terminal no longer reaches the
+/// group; stop a manual run's conversion by its group id (`kill -- -<pgid>`).
 fn output_with_timeout(
     cmd: &mut Command,
     limit: time::Duration,
@@ -4288,10 +4288,7 @@ fn output_with_timeout(
     };
 
     let Some(status) = status else {
-        // A negative pid addresses the group, whose id is the child's pid.
-        let group = format!("-{}", child.id());
-        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
-        let _ = child.wait();
+        stop_group(&mut child, STOP_GRACE);
         // Both readers finish once every process holding the pipes is dead.
         let _ = (stdout.join(), stderr.join());
         return Ok(None);
@@ -4307,6 +4304,48 @@ fn output_with_timeout(
         stdout: collect(stdout)?,
         stderr: collect(stderr)?,
     }))
+}
+
+/// How long a timed-out child's process group gets to exit after SIGTERM
+/// before whatever is left is killed.
+const STOP_GRACE: time::Duration = time::Duration::from_secs(10);
+
+// --------------------------------------------------
+/// End a timed-out child's process group: SIGTERM, then SIGKILL for anything
+/// still running after `grace`.
+///
+/// SIGTERM first lets a process clean up after itself. Xvfb, which
+/// create_preview.py starts for every thumbnail, removes its
+/// `/tmp/.X<N>-lock` and socket on SIGTERM and leaves both on SIGKILL
+/// (checked on md-process-2, 2026-11-16). When this sent SIGKILL alone, every
+/// thumbnail killed at the helper limit left a lock, create_preview.py skips
+/// a display whose lock exists, and the 101 numbers it tries (99-199) ran
+/// out: on 6 Nov about 160 systems failed with "No free display number found
+/// for Xvfb" (simulation-processing#33). SIGKILL still follows, which is what
+/// ends a wrapper that ignores SIGTERM.
+fn stop_group(child: &mut Child, grace: time::Duration) {
+    // A negative pid addresses the group, whose id is the child's pid.
+    let group = format!("-{}", child.id());
+    let signal = |sig: &str| {
+        Command::new("kill")
+            .args([sig, "--", &group])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    signal("-TERM");
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        // Reap the leader as it exits: a zombie still counts as a member,
+        // and the group would never look empty.
+        let _ = child.try_wait();
+        if !signal("-0") {
+            break;
+        }
+        thread::sleep(time::Duration::from_millis(100));
+    }
+    signal("-KILL");
+    let _ = child.wait();
 }
 
 /// For tests that run simulation-processing's Python scripts: can `uv` build
@@ -6025,6 +6064,62 @@ mol_id: No ligand-like residue found in minimal.pdb
             .unwrap()
             .success();
         assert!(!alive, "the grandchild (pid {}) survived", pid.trim());
+    }
+
+    #[test]
+    fn output_with_timeout_lets_the_group_clean_up_first() {
+        // Xvfb's shape: a grandchild that removes its lock on SIGTERM. Sent
+        // SIGKILL alone it never could (simulation-processing#33).
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("X150-lock");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sh -c 'trap \"rm -f {0}; exit 0\" TERM; touch {0}; \
+             while :; do sleep 1; done' & wait",
+            lock.display()
+        ));
+
+        let out = output_with_timeout(&mut cmd, time::Duration::from_secs(1)).unwrap();
+        assert!(out.is_none(), "should time out");
+        assert!(
+            !lock.exists(),
+            "the lock was left: the group got no SIGTERM"
+        );
+    }
+
+    #[test]
+    fn stop_group_kills_what_ignores_sigterm() {
+        // The cpptraj wrapper's shape: something that outlives SIGTERM still
+        // has to be gone once the grace period is over.
+        let dir = tempdir().unwrap();
+        let pidfile = dir.path().join("stubborn.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & \
+                 echo $! > {}; wait",
+                pidfile.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        while !pidfile.exists() {
+            thread::sleep(time::Duration::from_millis(20));
+        }
+        thread::sleep(time::Duration::from_millis(200)); // let the trap be set
+
+        let start = Instant::now();
+        stop_group(&mut child, time::Duration::from_secs(1));
+        assert!(start.elapsed() < time::Duration::from_secs(5));
+
+        let pid = fs::read_to_string(&pidfile).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "pid {} outlived the grace period", pid.trim());
     }
 
     // ── helper-script time limit ──────────────────────────────────────────
