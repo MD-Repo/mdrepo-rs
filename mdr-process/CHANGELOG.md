@@ -25,6 +25,18 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   it as long; it now leaves those bonds out of the count. The mmCIF writer
   still reads one as 0.0 and is not changed here.
 
+## 0.41.2 (unreleased)
+
+- **A helper killed at its time limit gets SIGTERM before SIGKILL.** The
+  thumbnail, RMSD/RMSF and conversion limits killed the helper's whole
+  process group with SIGKILL, so Xvfb, which create_preview.py starts, could
+  not remove its `/tmp/.X<N>-lock`. create_preview.py skips a display whose
+  lock exists, and once displays 99-199 were all taken every preview failed
+  ("No free display number found for Xvfb"; about 160 systems on 6 Nov,
+  simulation-processing#33). The group now gets SIGTERM and up to 10 s to
+  exit, and SIGKILL after that. Locks already left behind still have to be
+  deleted once.
+
 ## 0.41.0 (unreleased)
 
 - **New output check, `solute`: minimal must keep every residue full has**
