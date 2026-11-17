@@ -4,6 +4,22 @@ Notable user-facing changes to `mdr-meta`. Each entry here becomes the
 GitHub release note for that version (see `.github/workflows/release.yml`)
 -- write it before tagging, not after.
 
+## Unreleased
+
+Rename this heading to the version when tagging.
+
+### File-format messages quote every extension
+
+The two messages about file formats now quote every extension, the
+trajectories' too:
+
+```
+File formats are incompatible: structure ".cif", topology ".top", trajectory ".xtc", ".foo" match no supported engine's convention
+```
+
+Before, the trajectories were bare (`trajectory .xtc, .foo`), and the
+"software_name ... match ... instead" message quoted none of its three.
+
 ## 0.3.29
 
 0.3.28 was never released; this includes its changes.
