@@ -41,7 +41,7 @@ use std::{
 };
 
 use crate::{
-    psf_writer,
+    pdb_coords, psf_writer,
     sequence::{self, PolymerType},
 };
 
@@ -109,10 +109,12 @@ struct Atom {
     charge: Option<i32>,
 }
 
-/// The ATOM/HETATM records of the first model
-fn read_atoms(text: &str) -> Vec<Atom> {
+/// The ATOM/HETATM records of the first model. A coordinate that does not
+/// parse is an error (`pdb_coords`): it was read as 0.0 and published, an
+/// atom at the origin (mdrepo-rs#89).
+fn read_atoms(text: &str) -> Result<Vec<Atom>> {
     let mut atoms = vec![];
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
         if line.starts_with("ENDMDL") {
             break;
         }
@@ -122,6 +124,7 @@ fn read_atoms(text: &str) -> Vec<Atom> {
         }
         let col =
             |a: usize, b: usize| line.get(a..b.min(line.len())).unwrap_or("").trim();
+        // Occupancy and B-factor only: a blank one takes the default
         let num = |a: usize, b: usize, d: f64| col(a, b).parse::<f64>().unwrap_or(d);
         let name = col(12, 16).to_string();
         let charge = {
@@ -142,13 +145,13 @@ fn read_atoms(text: &str) -> Vec<Atom> {
             chain: col(21, 22).to_string(),
             resseq: col(22, 26).to_string(),
             icode: col(26, 27).to_string(),
-            xyz: [num(30, 38, 0.0), num(38, 46, 0.0), num(46, 54, 0.0)],
+            xyz: pdb_coords::read_xyz_at(i, line)?,
             occupancy: num(54, 60, 1.0),
             bfactor: num(60, 66, 0.0),
             charge,
         });
     }
-    atoms
+    Ok(atoms)
 }
 
 /// The CRYST1 box: lengths and angles
@@ -275,7 +278,7 @@ pub fn mmcif_text(
     input: &MmcifInput,
     bonds: &[(usize, usize)],
 ) -> Result<(String, MmcifCounts)> {
-    let atoms = read_atoms(pdb);
+    let atoms = read_atoms(pdb)?;
     if atoms.is_empty() {
         bail!("no atoms");
     }
@@ -998,7 +1001,7 @@ fn write_checked(
     bonds: &[(usize, usize)],
 ) -> Result<MmcifCounts> {
     let (text, counts) = mmcif_text(pdb, input, bonds)?;
-    let atoms = read_atoms(pdb);
+    let atoms = read_atoms(pdb)?;
     fs::write(path, &text)?;
     let back = read_back(&fs::read_to_string(path)?);
     let ok = match &back {
@@ -1040,7 +1043,8 @@ pub fn write_mmcifs(
 ) -> Result<(MmcifCounts, MmcifCounts)> {
     let full_text = fs::read_to_string(full_pdb)?;
     let min_text = fs::read_to_string(min_pdb)?;
-    let full_atoms = psf_writer::read_pdb(&full_text);
+    let full_atoms = psf_writer::read_pdb(&full_text)
+        .map_err(|e| anyhow!("{}: {e}", full_pdb.display()))?;
     let bonds = match bonds_tsv {
         Some(p) => psf_writer::read_bonds(&fs::read_to_string(p)?, full_atoms.len())?,
         None => vec![],
@@ -1048,7 +1052,8 @@ pub fn write_mmcifs(
     let min_bonds = if bonds.is_empty() {
         vec![]
     } else {
-        let min_atoms = psf_writer::read_pdb(&min_text);
+        let min_atoms = psf_writer::read_pdb(&min_text)
+            .map_err(|e| anyhow!("{}: {e}", min_pdb.display()))?;
         let in_full = psf_writer::find_in_full(&min_atoms, &full_atoms)
             .map_err(|e| anyhow!("{}: {e}", min_pdb.display()))?;
         let to_min: HashMap<usize, usize> =
@@ -1243,6 +1248,115 @@ mod tests {
         let (text, _) = mmcif_text(&pdb, &MmcifInput::default(), &[]).unwrap();
         assert!(!text.contains("_cell."));
         assert!(text.starts_with("data_MDREPO\n"));
+    }
+
+    /// `dimer()` with the z field of each line in `lines` (0-based, line 0
+    /// is CRYST1) set to `z`
+    fn dimer_with_z(lines: &[usize], z: &str) -> String {
+        dimer()
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut l = l.to_string();
+                if lines.contains(&i) {
+                    l.replace_range(46..54, &format!("{z:>8}"));
+                }
+                l + "\n"
+            })
+            .collect()
+    }
+
+    fn text_err(pdb: &str) -> String {
+        mmcif_text(pdb, &MmcifInput::default(), &[])
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn an_overflowed_coordinate_writes_no_mmcif() {
+        // mdrepo-rs#89: read as 0.0 and published at the origin before
+        let e = text_err(&dimer_with_z(&[2], "********"));
+        assert!(
+            e.starts_with("line 3: columns 47-54: an overflowed coordinate"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn read_atoms_itself_rejects_a_bad_coordinate() {
+        // mmcif_text also stops at sequence::residue_layout, so this pins
+        // the mmCIF reader's own rule: never a 0.0 in place of a coordinate
+        for z in ["********", "12.3ab", ""] {
+            let e = read_atoms(&dimer_with_z(&[2], z)).unwrap_err().to_string();
+            assert!(e.starts_with("line 3: columns 47-54: "), "{z:?}: {e}");
+        }
+        assert_eq!(read_atoms(&dimer()).unwrap().len(), 24);
+    }
+
+    #[test]
+    fn a_malformed_coordinate_writes_no_mmcif() {
+        for junk in ["12.3ab", "", "1.2.3"] {
+            let e = text_err(&dimer_with_z(&[2], junk));
+            assert!(e.starts_with("line 3: columns 47-54: "), "{junk:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn the_line_from_issue_89_writes_no_mmcif() {
+        let pdb = "ATOM     66  B     B    66       9.827 740.753********  1.00  \
+                   0.00           B  \nEND\n";
+        assert!(text_err(pdb).contains("an overflowed coordinate"));
+    }
+
+    #[test]
+    fn coordinates_at_the_edge_of_the_field_still_write() {
+        for z in ["9999.999", "-999.999"] {
+            let (text, _) =
+                mmcif_text(&dimer_with_z(&[2], z), &MmcifInput::default(), &[])
+                    .unwrap();
+            assert!(text.contains(z), "{z}");
+        }
+    }
+
+    /// write_mmcifs on the given full and minimal pdb texts in a temp dir;
+    /// the result and whether each mmCIF is on disk afterwards
+    fn write_pair(full: &str, min: &str) -> (Result<()>, bool, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (fp, mp) = (dir.path().join("full.pdb"), dir.path().join("minimal.pdb"));
+        fs::write(&fp, full).unwrap();
+        fs::write(&mp, min).unwrap();
+        let (fc, mc) = (
+            dir.path().join("full.mmcif"),
+            dir.path().join("minimal.mmcif"),
+        );
+        let r =
+            write_mmcifs(&fp, &mp, None, &fc, &mc, &MmcifInput::default()).map(|_| ());
+        (r, fc.exists(), mc.exists())
+    }
+
+    #[test]
+    fn a_bad_coordinate_in_full_leaves_neither_file() {
+        let (r, f, m) = write_pair(&dimer_with_z(&[2], "********"), &dimer());
+        assert!(r.unwrap_err().to_string().contains("full.pdb: line 3"));
+        assert!(!f && !m);
+    }
+
+    #[test]
+    fn a_bad_coordinate_in_minimal_removes_the_full_one_too() {
+        let (r, f, m) = write_pair(&dimer(), &dimer_with_z(&[2], "********"));
+        assert!(
+            r.unwrap_err()
+                .to_string()
+                .contains("an overflowed coordinate")
+        );
+        assert!(!f && !m, "full.mmcif must go when minimal.mmcif fails");
+    }
+
+    #[test]
+    fn a_clean_pair_still_writes_both() {
+        let (r, f, m) = write_pair(&dimer(), &dimer());
+        r.unwrap();
+        assert!(f && m);
     }
 
     #[test]

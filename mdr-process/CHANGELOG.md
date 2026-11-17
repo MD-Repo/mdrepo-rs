@@ -11,6 +11,23 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   database or iRODS, or in its command line;
 - **patch** (0.2.0 -> 0.2.1) for everything else.
 
+## 0.41.3 (unreleased)
+
+- **One reader for a PDB record's x, y, z (`pdb_coords`), and every
+  coordinate must parse.** Four readers had their own rule: sequence and
+  `check-outputs` stopped, but the psf and mmCIF writers read a coordinate
+  that did not parse as 0.0 and wrote that position out. All four now call
+  `pdb_coords::read_xyz`; a bad coordinate is an error naming the line and
+  columns. Today sequence extraction (and `residue_layout` inside the
+  mmCIF writer) stops such a file first, so no 0.0 reached a written file;
+  this keeps it that way if that ever changes (as #112 would have).
+- **An overflowed coordinate (`********`) is rejected with a message that
+  says so** ("an overflowed coordinate ...: the value does not fit the PDB
+  format (-999.999 to 9999.999 A)"), not "invalid float literal". Such data
+  is rejected, not read (Travis, on #112; #89).
+- Not detected: a C-style writer prints the wider number (`10000.500`),
+  which shifts every later column.
+
 ## 0.41.2 (unreleased)
 
 - **A helper killed at its time limit gets SIGTERM before SIGKILL.** The

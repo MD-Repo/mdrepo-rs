@@ -29,6 +29,7 @@
 use anyhow::{Result, anyhow, bail};
 use std::{collections::HashMap, fs, path::Path};
 
+use crate::pdb_coords;
 use crate::psf_elements::{WEIGHTS, parse_psf};
 
 /// Bonds longer than this (Å, no periodic image) are counted for a warning
@@ -66,8 +67,10 @@ pub fn write_psfs(
     min_psf: &Path,
     title: &str,
 ) -> Result<(PsfCounts, PsfCounts)> {
-    let full = read_pdb(&fs::read_to_string(full_pdb)?);
-    let min = read_pdb(&fs::read_to_string(min_pdb)?);
+    let full = read_pdb(&fs::read_to_string(full_pdb)?)
+        .map_err(|e| anyhow!("{}: {e}", full_pdb.display()))?;
+    let min = read_pdb(&fs::read_to_string(min_pdb)?)
+        .map_err(|e| anyhow!("{}: {e}", min_pdb.display()))?;
     if full.is_empty() {
         bail!("{} has no atoms", full_pdb.display());
     }
@@ -137,12 +140,14 @@ fn write_checked(
 }
 
 // --------------------------------------------------
-/// The atoms of a PDB's first model, with each atom's segment
-pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
+/// The atoms of a PDB's first model, with each atom's segment. A coordinate
+/// that does not parse is an error (`pdb_coords`); it was read as 0.0, which
+/// made every bond to the atom look long.
+pub fn read_pdb(text: &str) -> Result<Vec<PdbAtom>> {
     let mut atoms = vec![];
     let mut block = 0usize;
     let mut block_has_atoms = false;
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
         if line.starts_with("ENDMDL") {
             break;
         }
@@ -160,7 +165,6 @@ pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
         }
         let col =
             |a: usize, b: usize| line.get(a..b.min(line.len())).unwrap_or("").trim();
-        let coord = |a: usize, b: usize| col(a, b).parse::<f64>().unwrap_or(0.0);
         let name = col(12, 16).to_string();
         let chain = col(21, 22);
         // A blank chain column: its TER block, set below once the whole
@@ -178,13 +182,13 @@ pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
             resname: col(16, 21).to_string(),
             resid: col(22, 27).to_string(),
             segid,
-            xyz: [coord(30, 38), coord(38, 46), coord(46, 54)],
+            xyz: pdb_coords::read_xyz_at(i, line)?,
         });
         block_has_atoms = true;
     }
 
     blank_segments(&mut atoms);
-    atoms
+    Ok(atoms)
 }
 
 // --------------------------------------------------
@@ -467,8 +471,57 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_coordinate_is_an_error_not_zero() {
+        // Read as 0.0 before, which made every bond to the atom look long
+        for junk in ["  12.3ab", "********", "        "] {
+            let mut line = atom(1, "CA", "ALA", 'A', 1, "C", 0.0);
+            line.replace_range(46..54, junk);
+            let e = read_pdb(&line).unwrap_err().to_string();
+            assert!(e.starts_with("line 1: columns 47-54: "), "{junk:?}: {e}");
+        }
+        let cut = atom(1, "CA", "ALA", 'A', 1, "C", 0.0)[..46].to_string();
+        assert!(read_pdb(&cut).is_err());
+    }
+
+    #[test]
+    fn the_bad_line_is_counted_from_the_top_of_the_file() {
+        let mut bad = atom(2, "CA", "ALA", 'A', 2, "C", 0.0);
+        bad.replace_range(30..38, "********");
+        let pdb = format!("REMARK x\n{}{bad}", atom(1, "CA", "ALA", 'A', 1, "C", 0.0));
+        let e = read_pdb(&pdb).unwrap_err().to_string();
+        assert!(e.starts_with("line 3: columns 31-38: an overflowed"), "{e}");
+    }
+
+    #[test]
+    fn write_psfs_names_the_file_with_the_bad_coordinate() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let (full, min) = (d.path().join("full.pdb"), d.path().join("minimal.pdb"));
+        let mut bad = atom(1, "CA", "ALA", 'A', 1, "C", 0.0);
+        bad.replace_range(46..54, "********");
+        fs::write(&full, &bad)?;
+        fs::write(&min, &bad)?;
+        fs::write(d.path().join("bonds.tsv"), "")?;
+        let e = write_psfs(
+            &full,
+            &min,
+            &d.path().join("bonds.tsv"),
+            &d.path().join("full.psf"),
+            &d.path().join("minimal.psf"),
+            "t",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("full.pdb: line 1: columns 47-54: an overflowed"),
+            "{e}"
+        );
+        assert!(!d.path().join("full.psf").exists());
+        Ok(())
+    }
+
+    #[test]
     fn with_no_chain_id_at_all_ter_blocks_are_segments_but_water_is_wat() {
-        let atoms = read_pdb(&blank_chain_pdb());
+        let atoms = read_pdb(&blank_chain_pdb()).unwrap();
         let segs: Vec<&str> = atoms.iter().map(|a| a.segid.as_str()).collect();
         assert_eq!(segs, ["A", "A", "B", "B", "WAT", "WAT"]);
         assert_eq!(atoms[4].resid, "1");
@@ -481,7 +534,7 @@ mod tests {
         let pdb = atom(1, "N", "ALA", 'X', 1, "N", 0.0)
             + "TER\n"
             + &atom(2, "N", "ALA", 'X', 2, "N", 3.0);
-        let atoms = read_pdb(&pdb);
+        let atoms = read_pdb(&pdb).unwrap();
         assert_eq!(atoms[0].segid, "X");
         assert_eq!(atoms[1].segid, "X");
     }
@@ -505,7 +558,7 @@ mod tests {
             pdb += "TER\n";
         }
         pdb += &atom(13, "SOD", "SOD", ' ', 5, "NA", 90.0);
-        let atoms = read_pdb(&pdb);
+        let atoms = read_pdb(&pdb).unwrap();
         let got: Vec<(&str, &str)> = atoms
             .iter()
             .map(|a| (a.segid.as_str(), a.resid.as_str()))
@@ -532,7 +585,7 @@ mod tests {
 
     #[test]
     fn the_psf_reads_back_with_its_atoms_bonds_and_masses() {
-        let atoms = read_pdb(&blank_chain_pdb());
+        let atoms = read_pdb(&blank_chain_pdb()).unwrap();
         let bonds = vec![(0, 1), (2, 3), (4, 5)];
         let text = psf_text(&atoms, &bonds, "bonds from test.psf");
         let back = parse_psf(&text).unwrap();
@@ -560,7 +613,7 @@ mod tests {
 
     #[test]
     fn minimal_atoms_are_found_in_full_in_order() {
-        let full = read_pdb(&blank_chain_pdb());
+        let full = read_pdb(&blank_chain_pdb()).unwrap();
         let min: Vec<PdbAtom> = full[..4].to_vec();
         assert_eq!(find_in_full(&min, &full).unwrap(), [0, 1, 2, 3]);
         let mut wrong = full[..2].to_vec();
@@ -615,7 +668,7 @@ mod tests {
 
     #[test]
     fn long_bonds_are_counted() {
-        let atoms = read_pdb(&blank_chain_pdb());
+        let atoms = read_pdb(&blank_chain_pdb()).unwrap();
         // N(0) to N(10): a 10 A "bond"
         assert_eq!(count_long(&atoms, &[(0, 1), (0, 2)]), 1);
     }

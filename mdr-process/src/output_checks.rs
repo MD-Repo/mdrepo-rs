@@ -44,6 +44,7 @@
 //! real outputs (25 processed folders, 30 MDR-108 builds) on 2026-11-09,
 //! first as simulation-processing's check_outputs.py (#47).
 
+use crate::pdb_coords;
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use std::{
@@ -221,7 +222,7 @@ fn cols(line: &str, a: usize, b: usize) -> &str {
 pub fn read_pdb(path: &Path) -> Result<Structure> {
     let text = fs::read_to_string(path)?;
     let (mut atoms, mut xyz) = (vec![], vec![]);
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
         if line.starts_with("ATOM  ") || line.starts_with("HETATM") {
             atoms.push(Atom {
                 name: cols(line, 12, 16).trim().to_string(),
@@ -229,11 +230,7 @@ pub fn read_pdb(path: &Path) -> Result<Structure> {
                 resid: int(cols(line, 22, 26)),
                 element: cols(line, 76, 78).trim().to_string(),
             });
-            xyz.push([
-                float(cols(line, 30, 38))?,
-                float(cols(line, 38, 46))?,
-                float(cols(line, 46, 54))?,
-            ]);
+            xyz.push(pdb_coords::read_xyz_at(i, line)?);
         } else if line.starts_with("ENDMDL") {
             break;
         }
@@ -1478,6 +1475,28 @@ mod tests {
     }
 
     // --- box geometry ------------------------------------------------------
+    #[test]
+    fn read_pdb_names_a_bad_coordinate() -> Result<()> {
+        let d = tempfile::tempdir()?;
+        let p = d.path().join("o.pdb");
+        let mut line =
+            "ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C  "
+                .to_string();
+        line.replace_range(46..54, "********");
+        fs::write(&p, format!("{line}\nEND\n"))?;
+        let e = read_pdb(&p).unwrap_err().to_string();
+        assert!(
+            e.starts_with("line 1: columns 47-54: an overflowed coordinate"),
+            "{e}"
+        );
+        line.replace_range(46..54, "  12.3ab");
+        fs::write(&p, format!("{line}\nEND\n"))?;
+        let e = read_pdb(&p).unwrap_err().to_string();
+        assert!(e.starts_with("line 1: columns 47-54: "), "{e}");
+        assert!(!e.contains("overflowed"), "{e}");
+        Ok(())
+    }
+
     #[test]
     fn box_kinds() {
         let rows = |a: Xyz, b: Xyz, c: Xyz| [a, b, c];
