@@ -533,7 +533,10 @@ impl Meta {
         // Check that structure/topology/trajectory extensions form a
         // combination the declared engine could actually have produced.
         // CUSTOM is the deliberate escape hatch for pipelines with no fixed
-        // convention, so it is exempt. Two distinct failures, both fatal:
+        // convention, so it is exempt from that, but not from processing:
+        // every file must still be a format processing can read, or it
+        // fails only after upload (a CUSTOM `a.boo` passed every check).
+        // Two distinct failures for the other engines, both fatal:
         // the combination matches no engine at all (incompatible mixing),
         // or it matches some *other* engine but not the declared one
         // (software_name does not describe what was actually submitted).
@@ -544,6 +547,11 @@ impl Meta {
         // mdrepo-agent#88, and Zenodo 8420199's GROMACS run with a generated
         // .psf, mdrepo-agent#70). One it cannot read is still an error.
         let software_name = self.software_name.as_deref();
+        if software_name == Some("CUSTOM")
+            && let Some(combo) = self.format_combination()
+        {
+            found.extend(self.formats_processable(&combo));
+        }
         if software_name != Some("CUSTOM")
             && let Some(combo) = self.format_combination()
         {
@@ -3700,9 +3708,12 @@ mod agent_import_tests {
     }
 
     #[test]
-    fn custom_is_exempt_both_ways() {
-        let meta =
-            with_software(with_files("a.cif", "a.xyz", "a.h5"), Some(("CUSTOM", "NA")));
+    fn custom_needs_no_engines_combination_both_ways() {
+        // AMBER's topology, CHARMM's trajectory: no engine's set, all readable
+        let meta = with_software(
+            with_files("a.pdb", "a.prmtop", "a.dcd"),
+            Some(("CUSTOM", "NA")),
+        );
         assert!(
             meta.findings(PERSON).is_empty(),
             "{:?}",
@@ -3713,6 +3724,32 @@ mod agent_import_tests {
             "{:?}",
             meta.findings(AGENT)
         );
+    }
+
+    #[test]
+    fn custom_files_processing_cannot_read_are_errors_both_ways() {
+        let mut meta =
+            with_software(with_files("a.cif", "a.xyz", "a.h5"), Some(("CUSTOM", "NA")));
+        meta.trajectory_file_names.push("a.boo".to_string());
+        for opts in [PERSON, AGENT] {
+            let found = meta.findings(opts);
+            assert_eq!(
+                codes(&found, Level::Error),
+                vec!["unprocessable_format"; 4],
+                "{found:?}"
+            );
+            let fields: Vec<_> =
+                found.iter().filter_map(|f| f.field.as_deref()).collect();
+            assert_eq!(
+                fields,
+                vec![
+                    "topology_file_name",
+                    "structure_file_name",
+                    "trajectory_file_names[1]",
+                    "trajectory_file_names[2]",
+                ]
+            );
+        }
     }
 
     // --- GROMACS .top without coordinates (Zenodo 3975394) ---

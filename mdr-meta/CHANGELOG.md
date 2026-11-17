@@ -4,6 +4,22 @@ Notable user-facing changes to `mdr-meta`. Each entry here becomes the
 GitHub release note for that version (see `.github/workflows/release.yml`)
 -- write it before tagging, not after.
 
+## 0.3.31
+
+### CUSTOM files must be formats processing can read
+
+`software_name = "CUSTOM"` still needs no engine's usual combination of file
+formats, but each file must now be a format processing can read. A CUSTOM
+submission with `trajectory_file_names = ["a.boo"]` used to pass `check` and
+fail only after upload, when the trajectory could not be converted. Now:
+
+```
+trajectory_file_names[1]: ".boo" is not a trajectory format processing can read (crd, dcd, edr, mdc, mdcrd, nc, netcdf, trj, trr, xtc)
+```
+
+The same goes for the structure and topology. Every CUSTOM simulation in
+MDRepo so far (pdb/cor, psf, xtc/dcd/mdc) passes.
+
 ## 0.3.30
 
 ### File-format messages quote every extension
