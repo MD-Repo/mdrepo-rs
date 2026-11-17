@@ -1443,16 +1443,6 @@ pub struct InferredPeptide {
 }
 
 // --------------------------------------------------
-/// One entry of `inferred_ligands.json`: `{structure, name}` for a small
-/// molecule, `{peptide}` for a peptide ligand
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum InferredEntry {
-    Peptide { peptide: InferredPeptide },
-    Ligand(Box<InferredLigand>),
-}
-
-// --------------------------------------------------
 #[derive(Debug, Deserialize, Serialize)]
 pub struct InferredLigandName {
     pub smiles_input: String,
@@ -1499,12 +1489,19 @@ pub struct CheckedLigand {
     pub inchi2: String,
     pub connectivity_layer: Option<String>,
 
-    /// Whether the two differ in hydrogens by more than protonation: false
-    /// for benzene against cyclohexane or NAD+ against NADH, true for an
-    /// acid against its anion (hydrogens less charge agree). `None` from a
+    /// Whether hydrogens less charge agree, so that the two differ by
+    /// protonation at most: true for an acid against its anion, false for
+    /// benzene against cyclohexane or NAD+ against NADH. `None` from a
     /// compare_smiles.py that does not report it.
     #[serde(default)]
     pub same_hydrogens_less_charge: Option<bool>,
+
+    /// Whether the two have the same heavy atoms, element by element; part
+    /// of `same_connectivity` since review F4. `None` from a
+    /// compare_smiles.py from before that, whose `same_connectivity` is the
+    /// InChI /c layer alone (`compare_smiles` logs it).
+    #[serde(default)]
+    pub same_heavy_atoms: Option<bool>,
 }
 
 // --------------------------------------------------

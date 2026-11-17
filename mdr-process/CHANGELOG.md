@@ -24,7 +24,12 @@ hydrogens and an older `mol_id.py` no peptides, and both are read as before.
   element: benzene verified against pyridine, a fluoro- against a
   chloro-analogue, a thiophene against a selenophene. `compare_smiles.py`
   now requires the same heavy-atom formula as well, so those are "Unable to
-  verify ligand [n]". `place_ligands`' third step uses the same test.
+  verify ligand [n]". `place_ligands`' third step uses the same test. An
+  older script, which reports no `same_heavy_atoms`, is logged once as a
+  warning, since its verdicts are the /c layer alone.
+- **Two empty InChIs are no longer the same InChI.** When both toolkits fail
+  (OpenBabel's fallback can give "" for each), `same_inchi` was true and
+  verified the ligand with no hydrogen check.
 - **A hydrogen difference still verifies, with a warning when protonation
   does not explain it.** The declared ligand is accepted wherever it can be:
   an acid declared for a simulated carboxylate passes in silence, as before.
@@ -33,17 +38,24 @@ hydrogens and an older `mol_id.py` no peptides, and both are read as before.
   octenoic acid) the ligand is still accepted as declared and the record
   gets "Ligand [n] (...) has the heavy atoms and bonds of the ligand in the
   structure but not its hydrogens ...". When several inferred ligands match,
-  one with nothing to say is preferred.
+  one with nothing to say is preferred; after a match with a warning, only
+  candidates with its number of heavy atoms are compared.
 - **An inferred peptide ligand is recorded as a ligand by chain.**
   `mol_id.py` now reads a peptide of nonstandard residues bonded to no
   chain (cyclosporin's) as one ligand with a sequence, not one SMILES per
   residue name, and writes it to `inferred_ligands.json` as `{"peptide":
   ...}` beside the `{"structure", "name"}` entries. With no ligand declared
-  it is stored the way a peptide declared by sequence is: a ligand named by
-  its residues (`DAL-SAR-DAL-MLE`) pointing at the `chain_order` of the
-  structure chain with those residues. One that is none of the splitter's
-  chains is a warning and is not stored. A declared ligand list stands as
-  declared.
+  it is placed by the matcher a peptide declared by sequence is
+  (`place_chains`: caps split off by name, a chain taken once, then a
+  molecule of its composition) and stored as a ligand named by its residues
+  (`DAL-SAR-DAL-MLE`) pointing at that chain. Peptides with the same residues
+  are one ligand. One that cannot be placed is a warning and is not stored;
+  it never refuses the import. A declared ligand list stands as declared.
+  A declared SMILES is not compared with an inferred peptide (it has none);
+  when that peptide is all the structure holds, "Unable to verify ligand
+  [n]" says so instead of "no ligand was found in the structure".
+- A malformed entry in `inferred_ligands.json` is an error naming the entry
+  and what is wrong with it.
 - What an undeclared small-molecule ligand is stored as changes with
   `mol_id.py`, not here: its neutral form, from a bond-order search over
   charges 0 to +-6, and nothing for a glycan or a lipid written as several

@@ -4,7 +4,7 @@ use crate::{
     ticket::dsn_for,
     types::{
         CheckedLigand, DoiAuthor, DoiPaper, Duration, Export, ExportSimulation,
-        ImportChain, ImportJsonArgs, ImportResult, InferredEntry, InferredLigand,
+        ImportChain, ImportJsonArgs, ImportResult, InferredLigand,
         InferredLigandStructure, InferredPeptide, MdFile, PdbEntry, PdbResponse,
         ProcessArgs, ProcessResult, ProcessTrajectoryArgs, ProcessedTarball,
         ProcessedTrajectory, ProcessedTrajectoryType, PushOutcome, ResolvedLigand,
@@ -2200,6 +2200,25 @@ pub fn place_chains(
     ligands: Option<&Vec<metadata::Ligand>>,
     full_pdb: &Path,
 ) -> Result<(Vec<ImportChain>, HashMap<usize, u32>)> {
+    place_sequence_ligands(
+        structure_chains,
+        ligands.map_or(&[], |l| l.as_slice()),
+        true,
+        full_pdb,
+    )
+}
+
+/// `place_chains` for a list of sequence ligands. With `required` false (the
+/// peptides `mol_id.py` inferred, `inferred_peptide_ligand`) a ligand that
+/// cannot be placed is left out of the returned map rather than refusing the
+/// import; the caller says so. One matcher for both, so a declared and an
+/// inferred peptide agree on caps and on a chain taken once.
+fn place_sequence_ligands(
+    structure_chains: &[sequence::Chain],
+    ligands: &[metadata::Ligand],
+    required: bool,
+    full_pdb: &Path,
+) -> Result<(Vec<ImportChain>, HashMap<usize, u32>)> {
     // (first atom, chain, the ligand it is for)
     let mut placed: Vec<(usize, ImportChain, Option<usize>)> = structure_chains
         .iter()
@@ -2224,13 +2243,27 @@ pub fn place_chains(
 
     let mut pdb_text: Option<String> = None;
     let mut used_blobs: HashSet<usize> = HashSet::new();
-    for (num, ligand) in ligands.into_iter().flatten().enumerate() {
+    'ligands: for (num, ligand) in ligands.iter().enumerate() {
         let (Some(seq), Some(seq_type)) = (&ligand.sequence, ligand.sequence_type)
         else {
             continue;
         };
-        let declared = declared_chain(seq, seq_type)
-            .map_err(|e| anyhow!(r#"ligands[{}] "{}": {e}"#, num + 1, ligand.name))?;
+        // A ligand that cannot be placed: refused when declared, else passed
+        // over for the caller to report
+        macro_rules! unplaced {
+            ($e:expr) => {{
+                let e = anyhow!(r#"ligands[{}] "{}": {}"#, num + 1, ligand.name, $e);
+                if required {
+                    return Err(e);
+                }
+                debug!("Not placed: {e}");
+                continue 'ligands;
+            }};
+        }
+        let declared = match declared_chain(seq, seq_type) {
+            Ok(declared) => declared,
+            Err(e) => unplaced!(e),
+        };
 
         // 1. A chain the splitter found
         if let Some(slot) = placed.iter_mut().find(|(_, c, owner)| {
@@ -2249,7 +2282,7 @@ pub fn place_chains(
 
         // 2. A blob residue of the right composition: one formula for a
         // peptide; for DNA/RNA, with and without the 5' phosphate
-        let candidates = if seq_type == metadata::SequenceType::Protein {
+        let candidates = match if seq_type == metadata::SequenceType::Protein {
             sequence::expected_peptide_formula(
                 &declared.residues,
                 declared.n_terminal_cap.as_deref(),
@@ -2258,8 +2291,10 @@ pub fn place_chains(
             .map(|f| vec![f])
         } else {
             sequence::expected_nucleic_formulas(&declared.residues)
-        }
-        .map_err(|e| anyhow!(r#"ligands[{}] "{}": {e}"#, num + 1, ligand.name))?;
+        } {
+            Ok(candidates) => candidates,
+            Err(e) => unplaced!(e),
+        };
         if pdb_text.is_none() {
             pdb_text = Some(read_file(full_pdb)?);
         }
@@ -2275,16 +2310,14 @@ pub fn place_chains(
             }
         }
         let Some((blob, expected, n_blobs)) = found else {
-            bail!(
-                r#"ligands[{}] "{}": no chain in the structure has the sequence {seq}, and no other molecule has its heavy atoms ({})"#,
-                num + 1,
-                ligand.name,
+            unplaced!(format!(
+                "no chain in the structure has the sequence {seq}, and no other molecule has its heavy atoms ({})",
                 candidates
                     .iter()
                     .map(sequence::formula_text)
                     .collect::<Vec<_>>()
                     .join(" or ")
-            );
+            ))
         };
         if n_blobs > 1 {
             debug!(
@@ -2517,8 +2550,6 @@ pub fn make_import_json(
         );
     }
     get_sequence(&structure_chains, args.processed_dir)?;
-    let (mut chains, ligand_chains) =
-        place_chains(&structure_chains, args.meta.ligands.as_ref(), full_pdb)?;
 
     let rmsd_rmsf = get_all_rmsd_rmsf(
         args.example_trajectory,
@@ -2554,6 +2585,18 @@ pub fn make_import_json(
         )?
     };
 
+    // The declared sequence ligands are placed on chains, or with nothing
+    // declared the peptides mol_id.py found; only a declared one that cannot
+    // be placed refuses the import
+    let peptides = match args.meta.ligands {
+        Some(_) => vec![],
+        None => inferred_peptide_ligands(&inferred_peptides),
+    };
+    let (mut chains, ligand_chains) = match args.meta.ligands.as_ref() {
+        Some(declared) => place_chains(&structure_chains, Some(declared), full_pdb)?,
+        None => place_sequence_ligands(&structure_chains, &peptides, false, full_pdb)?,
+    };
+
     let file_md5s = get_file_md5s(&args.meta, args.input_dir);
     let unique_file_hash_string = unique_file_hash(&file_md5s);
     let legacy_unique_file_hash_string = legacy_unique_file_hash(&file_md5s);
@@ -2583,8 +2626,7 @@ pub fn make_import_json(
     let (ligands, ligand_warnings) = resolve_ligands(
         args.meta.ligands.as_ref(),
         inferred_ligands,
-        &inferred_peptides,
-        &chains,
+        &peptides,
         &ligand_chains,
         args.script_dir,
         args.uv,
@@ -2737,26 +2779,33 @@ pub fn make_import_json(
 /// hydrogen difference protonation does not explain (a redox or saturation
 /// state) still verifies, with a warning (`hydrogen_warning`).
 ///
-/// AN INFERRED PEPTIDE is a ligand by sequence: it points at the chain the
-/// splitter made of its residues (`peptide_chain`), as a peptide declared by
-/// sequence does. It is recorded only when nothing was declared, like every
-/// inferred ligand.
+/// AN INFERRED PEPTIDE is a ligand by sequence (`inferred_peptide_ligand`),
+/// placed on a chain by `place_sequence_ligands` as a declared one is;
+/// `ligand_chains` holds, by position in `peptides`, those it placed. It is
+/// recorded only when nothing was declared, like every inferred ligand. A
+/// declared SMILES is never compared with one: it has no SMILES.
+///
+/// `ligand_chains` is by position in whichever list was placed: the declared
+/// ligands when there are any, else `peptides`.
 fn resolve_ligands(
     given_ligands: Option<&Vec<metadata::Ligand>>,
     inferred_ligands: Vec<InferredLigand>,
-    inferred_peptides: &[InferredPeptide],
-    chains: &[ImportChain],
+    peptides: &[metadata::Ligand],
     ligand_chains: &HashMap<usize, u32>,
     script_dir: &Path,
     uv: &Path,
 ) -> Result<(Vec<ResolvedLigand>, Vec<String>)> {
     let mut ligands: Vec<metadata::Ligand> = vec![];
+    // The chain each of `ligands` points at, for a ligand by sequence
+    let mut chain_orders: Vec<Option<u32>> = vec![];
     let mut warnings = vec![];
     let declared = given_ligands.is_some();
-    let mut ligand_chains = ligand_chains.clone();
 
     if let Some(given_ligands) = given_ligands {
         ligands = given_ligands.clone();
+        chain_orders = (0..ligands.len())
+            .map(|num| ligand_chains.get(&num).copied())
+            .collect();
 
         if !inferred_ligands.is_empty() {
             for (ligand_num, given_ligand) in given_ligands.iter().enumerate() {
@@ -2767,13 +2816,17 @@ fn resolve_ligands(
                 // The match, and what there is to say about its hydrogens.
                 // One with nothing to say is preferred to one with a warning
                 let mut matched: Option<Option<String>> = None;
+                // Once a match with a warning is found, only a candidate with
+                // its heavy atoms can be a better one: each check is a Python
+                // process, so the others are not run
+                let mut heavy_atoms: Option<u32> = None;
                 for inferred in &inferred_ligands {
+                    let n = inferred.structure.num_heavy_atoms;
+                    if heavy_atoms.is_some_and(|h| h > 0 && n > 0 && h != n) {
+                        continue;
+                    }
                     let check = check_ligand(given_ligand, inferred, script_dir, uv)?;
-                    if !(check.exact_match
-                        || check.same_connectivity
-                        || check.same_connectivity_and_stereo
-                        || check.same_inchi)
-                    {
+                    if !verified(&check) {
                         continue;
                     }
                     match hydrogen_warning(ligand_num, given_ligand, &check) {
@@ -2783,6 +2836,7 @@ fn resolve_ligands(
                         }
                         warning => {
                             matched.get_or_insert(warning);
+                            heavy_atoms.get_or_insert(n);
                         }
                     }
                 }
@@ -2790,13 +2844,14 @@ fn resolve_ligands(
                     Some(None) => {}
                     Some(Some(warning)) => warnings.push(warning),
                     None => warnings.push(format!(
-                        "Unable to verify ligand [{ligand_num}] ({})",
-                        given_ligand.identity()
+                        "Unable to verify ligand [{ligand_num}] ({}){}",
+                        given_ligand.identity(),
+                        peptide_aside(peptides)
                     )),
                 }
             }
         } else {
-            warnings.extend(unverifiable_ligands(given_ligands));
+            warnings.extend(unverifiable_ligands(given_ligands, peptides));
         }
     } else {
         for ligand in inferred_ligands {
@@ -2813,24 +2868,19 @@ fn resolve_ligands(
                 sequence: None,
                 sequence_type: None,
             });
+            chain_orders.push(None);
         }
-        for peptide in inferred_peptides {
-            let name = peptide_name(peptide);
-            let Some(chain_order) = peptide_chain(peptide, chains) else {
+        for (num, peptide) in peptides.iter().enumerate() {
+            let Some(&chain_order) = ligand_chains.get(&num) else {
                 warnings.push(format!(
-                    "A peptide ligand ({name}) was found in the structure but \
-                     is none of its chains, so it was not recorded"
+                    "A peptide ligand ({}) was found in the structure but is \
+                     none of its chains, so it was not recorded",
+                    peptide.name
                 ));
                 continue;
             };
-            ligand_chains.insert(ligands.len(), chain_order);
-            ligands.push(metadata::Ligand {
-                name,
-                smiles: None,
-                inchi: None,
-                sequence: Some(peptide.sequence.clone()),
-                sequence_type: Some(metadata::SequenceType::Protein),
-            });
+            ligands.push(peptide.clone());
+            chain_orders.push(Some(chain_order));
         }
     }
 
@@ -2859,11 +2909,11 @@ fn resolve_ligands(
 
     let out = ligands
         .into_iter()
-        .enumerate()
+        .zip(chain_orders)
         .zip(declared_identity)
-        .map(|((num, given), declared_identity)| {
+        .map(|((given, chain_order), declared_identity)| {
             if given.is_sequence() {
-                let chain_order = *ligand_chains.get(&num).ok_or_else(|| {
+                let chain_order = chain_order.ok_or_else(|| {
                     anyhow!(r#"Ligand "{}" was not matched to a chain"#, given.name)
                 })?;
                 return Ok(ResolvedLigand {
@@ -3083,7 +3133,7 @@ fn hydrogen_warning(
     check: &CheckedLigand,
 ) -> Option<String> {
     if check.exact_match
-        || check.same_inchi
+        || same_nonempty_inchi(check)
         || check.same_hydrogens_less_charge != Some(false)
     {
         return None;
@@ -3100,33 +3150,46 @@ fn hydrogen_warning(
 }
 
 // --------------------------------------------------
-/// The `chain_order` of the structure chain an inferred peptide ligand is:
-/// the first protein chain the splitter cut with the peptide's residues,
-/// caps aside. `None` when the splitter made no such chain.
-fn peptide_chain(peptide: &InferredPeptide, chains: &[ImportChain]) -> Option<u32> {
-    let names: Vec<String> = peptide
-        .resnames
+/// Whether `compare_smiles.py` verified a declared structure: an exact
+/// match, the same heavy atoms and bonds, or the same InChI. Two empty
+/// InChIs are not the same InChI: both toolkits failed, and that says nothing
+/// about the molecules (OpenBabel's fallback can give "" for each).
+fn verified(check: &CheckedLigand) -> bool {
+    check.exact_match
+        || check.same_connectivity
+        || check.same_connectivity_and_stereo
+        || same_nonempty_inchi(check)
+}
+
+fn same_nonempty_inchi(check: &CheckedLigand) -> bool {
+    check.same_inchi && !check.inchi1.is_empty() && !check.inchi2.is_empty()
+}
+
+// --------------------------------------------------
+/// The peptides `mol_id.py` inferred, as ligands declared by sequence, so
+/// that `place_sequence_ligands` places them the way it places a declared
+/// one. The sequence is the residue names as component codes,
+/// `(ACE)(DAL)(SAR)(DAL)(MLE)(NME)`, caps included: `declared_chain` splits
+/// those off by name. Two with the same residues are one ligand, as two
+/// copies of a small molecule are, and would otherwise share a name.
+pub fn inferred_peptide_ligands(peptides: &[InferredPeptide]) -> Vec<metadata::Ligand> {
+    let mut seen = HashSet::new();
+    peptides
         .iter()
-        .map(|n| sequence::canonical(n))
-        .collect();
-    let n = names.len();
-    // The whole list, then less a cap at either end or both
-    let bodies = [
-        (0, n),
-        (1, n),
-        (0, n.saturating_sub(1)),
-        (1, n.saturating_sub(1)),
-    ];
-    chains
-        .iter()
-        .find(|c| {
-            c.source == "structure"
-                && c.polymer_type == sequence::PolymerType::Protein.to_string()
-                && bodies
+        .filter(|p| seen.insert(&p.resnames))
+        .map(|p| metadata::Ligand {
+            name: peptide_name(p),
+            smiles: None,
+            inchi: None,
+            sequence: Some(
+                p.resnames
                     .iter()
-                    .any(|&(a, b)| a < b && c.residues[..] == names[a..b])
+                    .map(|r| format!("({})", r.trim().to_uppercase()))
+                    .collect(),
+            ),
+            sequence_type: Some(metadata::SequenceType::Protein),
         })
-        .map(|c| c.chain_order)
+        .collect()
 }
 
 /// A name for an inferred peptide ligand: its residue names, `DAL-SAR-DAL-MLE`,
@@ -3141,6 +3204,21 @@ fn peptide_name(peptide: &InferredPeptide) -> String {
         "{}-... ({} residues)",
         names[..SHOWN].join("-"),
         names.len()
+    )
+}
+
+/// What to add to "Unable to verify ligand [n]" when the structure has a
+/// peptide ligand, which a declared SMILES is never compared with
+fn peptide_aside(peptides: &[metadata::Ligand]) -> String {
+    if peptides.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = peptides.iter().map(|p| p.name.as_str()).collect();
+    format!(
+        ": the structure has a peptide ligand ({}), which is read by its \
+         sequence and has no SMILES to compare with; a peptide ligand is \
+         declared by sequence",
+        names.join(", ")
     )
 }
 
@@ -3195,7 +3273,21 @@ pub fn compare_smiles(
     }
 
     let stdout = str::from_utf8(&output.stdout)?;
-    let checked = serde_json::from_str(stdout)?;
+    let checked: CheckedLigand = serde_json::from_str(stdout)?;
+    // A compare_smiles.py from before review F4 says nothing of heavy atoms,
+    // and its `same_connectivity` is the /c layer alone: benzene is pyridine
+    // by it. Nothing here can tell that from the result, so say it, once
+    if checked.same_heavy_atoms.is_none() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            warn!(
+                "{} reports no same_heavy_atoms: it predates the heavy-atom \
+                 check, so a declared ligand is verified on the InChI /c \
+                 layer alone and a different element can pass",
+                script.display()
+            )
+        });
+    }
     Ok(checked)
 }
 
@@ -3218,17 +3310,24 @@ pub fn same_connectivity(
 /// the structure, so there is nothing to check it against. That used to pass
 /// in silence, and is how a ligand dropped as a chain residue would have gone
 /// unnoticed. A sequence is matched to a chain instead, and is not checked.
-fn unverifiable_ligands(given: &[metadata::Ligand]) -> Vec<String> {
+///
+/// When the structure's only ligand is a peptide, that is said instead: a
+/// ligand was found, but one a SMILES is not compared with.
+fn unverifiable_ligands(
+    given: &[metadata::Ligand],
+    peptides: &[metadata::Ligand],
+) -> Vec<String> {
     given
         .iter()
         .enumerate()
         .filter(|(_, l)| !l.is_sequence())
         .map(|(num, l)| {
-            format!(
-                "Unable to verify ligand [{num}] ({}): no ligand was found in \
-                 the structure",
-                l.identity()
-            )
+            let why = if peptides.is_empty() {
+                ": no ligand was found in the structure".to_string()
+            } else {
+                peptide_aside(peptides)
+            };
+            format!("Unable to verify ligand [{num}] ({}){why}", l.identity())
         })
         .collect()
 }
@@ -3352,18 +3451,29 @@ pub fn get_inferred_ligands(
 }
 
 // --------------------------------------------------
-/// `inferred_ligands.json` as its small molecules and its peptide ligands
+/// `inferred_ligands.json` as its small molecules (`{structure, name}`) and
+/// its peptide ligands (`{peptide}`). The shape is told by the `peptide` key
+/// and then read as that shape, so a malformed entry names its position and
+/// serde's own complaint, not "did not match any variant".
 fn parse_inferred_ligands(
     contents: &str,
 ) -> Result<(Vec<InferredLigand>, Vec<InferredPeptide>)> {
-    let entries: Vec<InferredEntry> = serde_json::from_str(contents)?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(contents)
+        .map_err(|e| anyhow!("inferred_ligands.json: {e}"))?;
     let mut ligands = vec![];
     let mut peptides = vec![];
-    for entry in entries {
-        match entry {
-            InferredEntry::Ligand(ligand) => ligands.push(*ligand),
-            InferredEntry::Peptide { peptide } => peptides.push(peptide),
-        }
+    for (num, mut entry) in entries.into_iter().enumerate() {
+        let read = match entry.get_mut("peptide").map(serde_json::Value::take) {
+            Some(peptide) => serde_json::from_value(peptide)
+                .map(|p| peptides.push(p))
+                .map_err(|e| ("peptide", e)),
+            None => serde_json::from_value(entry)
+                .map(|l| ligands.push(l))
+                .map_err(|e| ("ligand", e)),
+        };
+        read.map_err(|(shape, e)| {
+            anyhow!("inferred_ligands.json: entry {num} ({shape}): {e}")
+        })?;
     }
     Ok((ligands, peptides))
 }
@@ -5312,7 +5422,7 @@ END
                 sequence_type: Some(metadata::SequenceType::Protein),
             },
         ];
-        let warnings = unverifiable_ligands(&given);
+        let warnings = unverifiable_ligands(&given, &[]);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("Unable to verify ligand [0] ("));
         assert!(warnings[0].ends_with("no ligand was found in the structure"));
@@ -5386,7 +5496,6 @@ mol_id: No ligand-like residue found in minimal.pdb
         let (resolved, _) = resolve_ligands(
             Some(&given),
             vec![],
-            &[],
             &[],
             &HashMap::new(),
             script_dir,
@@ -6075,6 +6184,18 @@ mol_id: No ligand-like residue found in minimal.pdb
         .then_some((uv, script_dir))
     }
 
+    /// `resolver_available`, and a compare_smiles.py with the heavy-atom
+    /// check (review F4): one from before passes benzene for pyridine, which
+    /// is a fact about the checkout, not about this code.
+    fn heavy_atom_check_available() -> Option<(std::path::PathBuf, &'static Path)> {
+        let (uv, script_dir) = resolver_available()?;
+        compare_smiles("c1ccccc1", "c1ccncc1", script_dir, &uv)
+            .ok()?
+            .same_heavy_atoms
+            .is_some()
+            .then_some((uv, script_dir))
+    }
+
     /// THE REGRESSION THIS FILE EXISTS FOR.
     ///
     /// `declared_identity` records which notation the submitter supplied, and
@@ -6109,7 +6230,6 @@ mol_id: No ligand-like residue found in minimal.pdb
         let (ligands, _) = resolve_ligands(
             Some(&given),
             vec![],
-            &[],
             &[],
             &HashMap::new(),
             script_dir,
@@ -6170,24 +6290,24 @@ mol_id: No ligand-like residue found in minimal.pdb
         }
     }
 
-    fn structure_chain(
-        order: u32,
-        polymer_type: &str,
+    /// A chain as the splitter reports it
+    fn splitter_chain(
+        label: &str,
+        polymer_type: sequence::PolymerType,
         residues: &[&str],
-    ) -> ImportChain {
-        ImportChain {
-            chain_order: order,
-            chain_label: "A".into(),
-            source: "structure".into(),
-            polymer_type: polymer_type.into(),
-            sequence: "X".repeat(residues.len()),
+        first_atom: usize,
+    ) -> sequence::Chain {
+        sequence::Chain {
+            label: label.into(),
+            polymer_type,
             residues: residues.iter().map(|r| r.to_string()).collect(),
-            first_residue: Some(1),
-            last_residue: Some(residues.len() as i32),
+            sequence: "X".repeat(residues.len()),
+            first_residue: 1,
+            last_residue: residues.len() as i32,
             n_terminal_cap: None,
             c_terminal_cap: None,
             breaks: vec![],
-            reference: None,
+            first_atom,
         }
     }
 
@@ -6224,25 +6344,87 @@ mol_id: No ligand-like residue found in minimal.pdb
         assert_eq!(ligands[0].structure.resname, "BEN");
         assert_eq!(peptides, vec![tetrapeptide()]);
         assert!(parse_inferred_ligands("[]").unwrap().0.is_empty());
+
+        // A malformed entry says which, and what serde found wrong with it
+        let err = parse_inferred_ligands(
+            r#"[{"peptide": {"sequence": "XX", "residues": ["DAL", "SAR"]}}]"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("entry 0 (peptide)"), "{err}");
+        assert!(err.contains("resnames"), "{err}");
     }
 
+    /// An inferred peptide is placed by the matcher a declared one is
+    /// (`place_sequence_ligands`): caps split off by name, a chain taken once,
+    /// and one it cannot place left out rather than refusing the import.
     #[test]
-    fn an_inferred_peptide_is_the_chain_with_its_residues() {
-        let chains = vec![
-            structure_chain(1, "protein", &["MET", "ALA", "GLY"]),
-            structure_chain(2, "dna", &["DAL", "SAR", "DAL", "MLE"]),
-            structure_chain(3, "protein", &["DAL", "SAR", "DAL", "MLE"]),
+    fn an_inferred_peptide_is_placed_like_a_declared_one() {
+        use sequence::PolymerType::{Dna, Protein};
+        let dir = tempfile::tempdir().unwrap();
+        let pdb = complex(dir.path(), vec![]);
+        let structure = vec![
+            splitter_chain("A", Protein, &["MET", "ALA", "GLY"], 0),
+            splitter_chain("B", Dna, &["DAL", "SAR", "DAL", "MLE"], 10),
+            splitter_chain("C", Protein, &["DAL", "SAR", "DAL", "MLE"], 20),
         ];
-        assert_eq!(peptide_chain(&tetrapeptide(), &chains), Some(3));
+        let place = |peptides: &[InferredPeptide]| {
+            let ligands = inferred_peptide_ligands(peptides);
+            place_sequence_ligands(&structure, &ligands, false, &pdb)
+                .unwrap()
+                .1
+        };
+
+        assert_eq!(place(&[tetrapeptide()]), HashMap::from([(0, 3)]));
 
         // The splitter leaves caps out of a chain's residues; mol_id.py
         // names them
         let mut capped = tetrapeptide();
         capped.resnames.insert(0, "ACE".into());
         capped.resnames.push("NME".into());
-        assert_eq!(peptide_chain(&capped, &chains), Some(3));
+        assert_eq!(place(&[capped]), HashMap::from([(0, 3)]));
 
-        assert_eq!(peptide_chain(&tetrapeptide(), &chains[..2]), None);
+        // Only a cap is trimmed: MLE is not one, so MLE-DAL-SAR is not the
+        // chain DAL-SAR (review of #107)
+        let structure = vec![splitter_chain("A", Protein, &["DAL", "SAR"], 0)];
+        let ligands = inferred_peptide_ligands(&[InferredPeptide {
+            sequence: "XXX".into(),
+            resnames: ["MLE", "DAL", "SAR"].map(String::from).to_vec(),
+            cyclic: false,
+        }]);
+        assert_eq!(ligands[0].sequence.as_deref(), Some("(MLE)(DAL)(SAR)"));
+        let (_, placed) =
+            place_sequence_ligands(&structure, &ligands, false, &pdb).unwrap();
+        assert!(placed.is_empty(), "{placed:?}");
+        // ... which, declared, would refuse the import
+        assert!(place_sequence_ligands(&structure, &ligands, true, &pdb).is_err());
+    }
+
+    /// Two entries with the same residues are one ligand: they would share
+    /// a name, and `upsert_ligand` finds a row by name.
+    #[test]
+    fn inferred_peptides_with_the_same_residues_are_one_ligand() {
+        let ligands = inferred_peptide_ligands(&[tetrapeptide(), tetrapeptide()]);
+        assert_eq!(ligands.len(), 1);
+        assert_eq!(ligands[0].name, "DAL-SAR-DAL-MLE");
+        assert_eq!(ligands[0].sequence.as_deref(), Some("(DAL)(SAR)(DAL)(MLE)"));
+
+        // And a declared one is not placed twice on one chain either
+        use sequence::PolymerType::Protein;
+        let dir = tempfile::tempdir().unwrap();
+        let pdb = complex(dir.path(), vec![]);
+        let structure = vec![
+            splitter_chain("A", Protein, &["DAL", "SAR", "DAL", "MLE"], 0),
+            splitter_chain("B", Protein, &["DAL", "SAR", "DAL", "MLE"], 20),
+        ];
+        let twice = [ligands[0].clone(), ligands[0].clone()];
+        let (_, placed) =
+            place_sequence_ligands(&structure, &twice, false, &pdb).unwrap();
+        assert_eq!(placed, HashMap::from([(0, 1), (1, 2)]));
+    }
+
+    #[test]
+    fn an_inferred_peptide_is_named_by_its_residues() {
         assert_eq!(peptide_name(&tetrapeptide()), "DAL-SAR-DAL-MLE");
         let long = InferredPeptide {
             sequence: "X".repeat(11),
@@ -6257,24 +6439,20 @@ mol_id: No ligand-like residue found in minimal.pdb
 
     /// With nothing declared, an inferred peptide is recorded as a ligand
     /// pointing at its chain, the way a peptide declared by sequence is. One
-    /// the splitter made no chain of is said, not stored.
+    /// that was not placed is said, not stored.
     #[test]
     fn an_inferred_peptide_is_a_ligand_by_chain() {
         let Some((uv, script_dir)) = resolver_available() else {
             eprintln!("skipping: no uv, resolver script or Python environment");
             return;
         };
-        let chains = vec![
-            structure_chain(1, "protein", &["MET", "ALA", "GLY"]),
-            structure_chain(2, "protein", &["DAL", "SAR", "DAL", "MLE"]),
-        ];
+        let peptides = inferred_peptide_ligands(&[tetrapeptide()]);
 
         let (ligands, warnings) = resolve_ligands(
             None,
             vec![],
-            &[tetrapeptide()],
-            &chains,
-            &HashMap::new(),
+            &peptides,
+            &HashMap::from([(0, 2)]),
             script_dir,
             &uv,
         )
@@ -6286,16 +6464,9 @@ mol_id: No ligand-like residue found in minimal.pdb
         assert_eq!(ligands[0].smiles, None);
         assert_eq!(ligands[0].declared_identity, None);
 
-        let (ligands, warnings) = resolve_ligands(
-            None,
-            vec![],
-            &[tetrapeptide()],
-            &chains[..1],
-            &HashMap::new(),
-            script_dir,
-            &uv,
-        )
-        .unwrap();
+        let (ligands, warnings) =
+            resolve_ligands(None, vec![], &peptides, &HashMap::new(), script_dir, &uv)
+                .unwrap();
         assert!(ligands.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("DAL-SAR-DAL-MLE"), "{warnings:?}");
@@ -6305,8 +6476,7 @@ mol_id: No ligand-like residue found in minimal.pdb
         let (ligands, _) = resolve_ligands(
             Some(&given),
             vec![inferred_molecule("NC(=N)c1ccccc1", "BEN")],
-            &[tetrapeptide()],
-            &chains,
+            &peptides,
             &HashMap::new(),
             script_dir,
             &uv,
@@ -6314,6 +6484,26 @@ mol_id: No ligand-like residue found in minimal.pdb
         .unwrap();
         assert_eq!(ligands.len(), 1);
         assert_eq!(ligands[0].name, "benzamidine");
+    }
+
+    /// A declared SMILES is never compared with an inferred peptide, which
+    /// has none. When that peptide is all mol_id.py found, the warning says
+    /// so rather than "no ligand was found" (review of #107).
+    #[test]
+    fn a_smiles_against_a_peptide_says_a_peptide_was_found() {
+        let peptides = inferred_peptide_ligands(&[tetrapeptide()]);
+        let given = vec![declared_smiles("cyclosporin", "CC(C)C")];
+
+        let warnings = unverifiable_ligands(&given, &peptides);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("Unable to verify ligand [0] (CC(C)C): the structure has a peptide ligand (DAL-SAR-DAL-MLE)"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains("no ligand was found"), "{warnings:?}");
+
+        let warnings = unverifiable_ligands(&given, &[]);
+        assert!(warnings[0].ends_with("no ligand was found in the structure"));
     }
 
     fn checked(
@@ -6337,7 +6527,26 @@ mol_id: No ligand-like residue found in minimal.pdb
             inchi2: String::new(),
             connectivity_layer: None,
             same_hydrogens_less_charge,
+            same_heavy_atoms: Some(same_connectivity),
         }
+    }
+
+    /// Two empty InChIs (both toolkits failed) are not the same molecule,
+    /// and say nothing about hydrogens either (review of #107)
+    #[test]
+    fn two_empty_inchis_do_not_verify() {
+        let mut check = checked(false, false, Some(false));
+        check.same_inchi = true;
+        assert!(!verified(&check));
+
+        check.inchi1 = "InChI=1S/CH4/h1H4".into();
+        check.inchi2 = "InChI=1S/CH4/h1H4".into();
+        assert!(verified(&check));
+
+        let ligand = declared_smiles("methane", "C");
+        let mut empty = checked(false, true, Some(false));
+        empty.same_inchi = true;
+        assert!(hydrogen_warning(0, &ligand, &empty).is_some());
     }
 
     #[test]
@@ -6371,8 +6580,11 @@ mol_id: No ligand-like residue found in minimal.pdb
     /// a warning; protonation verifies in silence.
     #[test]
     fn a_declared_ligand_is_verified_on_heavy_atoms_and_warned_on_hydrogens() {
-        let Some((uv, script_dir)) = resolver_available() else {
-            eprintln!("skipping: no uv, resolver script or Python environment");
+        let Some((uv, script_dir)) = heavy_atom_check_available() else {
+            eprintln!(
+                "skipping: no uv, resolver script or Python environment, or a \
+                 compare_smiles.py from before the heavy-atom check"
+            );
             return;
         };
         let run = |declared: &str, inferred: &[&str]| {
@@ -6384,7 +6596,6 @@ mol_id: No ligand-like residue found in minimal.pdb
             resolve_ligands(
                 Some(&given),
                 inferred,
-                &[],
                 &[],
                 &HashMap::new(),
                 script_dir,
@@ -6460,7 +6671,7 @@ mol_id: No ligand-like residue found in minimal.pdb
         }];
 
         let (ligands, _) =
-            resolve_ligands(None, inferred, &[], &[], &HashMap::new(), script_dir, &uv)
+            resolve_ligands(None, inferred, &[], &HashMap::new(), script_dir, &uv)
                 .unwrap();
 
         assert_eq!(ligands.len(), 1);
