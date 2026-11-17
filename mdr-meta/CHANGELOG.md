@@ -4,9 +4,7 @@ Notable user-facing changes to `mdr-meta`. Each entry here becomes the
 GitHub release note for that version (see `.github/workflows/release.yml`)
 -- write it before tagging, not after.
 
-## Unreleased
-
-Rename this heading to the version when tagging.
+## 0.3.30
 
 ### File-format messages quote every extension
 
