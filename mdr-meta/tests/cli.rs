@@ -265,3 +265,16 @@ fn to_toml() -> Result<()> {
         exit_code: Some(0),
     })
 }
+
+// --------------------------------------------------
+#[test]
+fn spec_prints_the_choices_as_json() -> Result<()> {
+    Command::cargo_bin(PRG)?
+        .arg("spec")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""water_models""#))
+        .stdout(predicate::str::contains(r#""CUSTOM": ["#))
+        .stdout(predicate::str::contains(r#""TIP3P""#));
+    Ok(())
+}
