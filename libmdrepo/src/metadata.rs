@@ -249,8 +249,14 @@ struct FormatCombination {
 }
 
 impl FormatCombination {
+    /// Each trajectory extension quoted, as the messages quote the
+    /// structure's and topology's: `".xtc", ".foo"`
     fn trajectory_display(&self) -> String {
-        format!(".{}", self.trajectory_exts.join(", ."))
+        self.trajectory_exts
+            .iter()
+            .map(|ext| format!("\".{ext}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -575,7 +581,7 @@ impl Meta {
                     "format_mismatch",
                     format!(
                         "software_name is \"{}\" but structure/topology/\
-                        trajectory extensions (.{}, .{}, {}) match {} instead",
+                        trajectory extensions (\".{}\", \".{}\", {}) match {} instead",
                         name,
                         combo.structure_ext,
                         combo.topology_ext,
@@ -3555,6 +3561,25 @@ mod agent_import_tests {
     }
 
     #[test]
+    fn every_extension_is_quoted_when_formats_match_no_engine() {
+        let mut meta = with_files("model.cif", "model.top", "a.xtc");
+        meta.trajectory_file_names.push("b.foo".to_string());
+        let found = meta.findings(PERSON);
+        let message = found
+            .iter()
+            .find(|f| f.code == "format_incompatible")
+            .map(|f| f.message.as_str());
+        assert_eq!(
+            message,
+            Some(
+                "File formats are incompatible: structure \".cif\", topology \
+                \".top\", trajectory \".xtc\", \".foo\" match no supported \
+                engine's convention"
+            )
+        );
+    }
+
+    #[test]
     fn a_mismatch_refuses_a_persons_file() {
         let found = gromacs_with_psf().findings(PERSON);
         assert_eq!(codes(&found, Level::Error), vec!["format_mismatch"]);
@@ -3562,7 +3587,7 @@ mod agent_import_tests {
         assert_eq!(
             found[0].message,
             "software_name is \"GROMACS\" but structure/topology/trajectory \
-            extensions (.pdb, .psf, .xtc) match ACEMD or CHARMM or NAMD instead"
+            extensions (\".pdb\", \".psf\", \".xtc\") match ACEMD or CHARMM or NAMD instead"
         );
     }
 
