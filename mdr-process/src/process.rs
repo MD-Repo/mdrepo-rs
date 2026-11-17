@@ -6112,14 +6112,27 @@ mol_id: No ligand-like residue found in minimal.pdb
         stop_group(&mut child, time::Duration::from_secs(1));
         assert!(start.elapsed() < time::Duration::from_secs(5));
 
+        // SIGKILL is delivered at once, but the pid lingers until it is
+        // reaped, and its parent (the group leader) is dead too, so init
+        // reaps it whenever it gets to it. `kill -0` succeeds on a zombie, so
+        // wait briefly for the pid to be gone or a zombie: either is dead.
         let pid = fs::read_to_string(&pidfile).unwrap();
-        let alive = Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        assert!(!alive, "pid {} outlived the grace period", pid.trim());
+        let pid = pid.trim();
+        let deadline = Instant::now() + time::Duration::from_secs(2);
+        let mut dead = false;
+        while Instant::now() < deadline {
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout);
+            if stat.trim().is_empty() || stat.trim_start().starts_with('Z') {
+                dead = true;
+                break;
+            }
+            thread::sleep(time::Duration::from_millis(20));
+        }
+        assert!(dead, "pid {pid} outlived the grace period");
     }
 
     // ── helper-script time limit ──────────────────────────────────────────
