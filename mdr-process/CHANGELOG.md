@@ -11,6 +11,35 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   database or iRODS, or in its command line;
 - **patch** (0.2.0 -> 0.2.1) for everything else.
 
+## 0.42.0 (unreleased)
+
+- **New output check, `solvent`: minimal must keep none of what it is meant
+  to strip.** `solute` turned around. Found 2026-11-17: Zenodo 4501408's 20
+  staging deposits kept all their water in minimal (MDR00004692: 190,491 of
+  221,089 atoms) because Desmond names TIP3P `T3P` and simulation-processing's
+  `KNOWN_WATER` did not have it (simulation-processing#59, fixed in #60).
+  Nothing caught it until the viewer showed the protein buried in solvent.
+  - FAIL when minimal holds a residue `dropped_from_minimal` names (water,
+    the stripped ions, lipids; `MINIMAL_DROPS` and `sequence::WATER`). The
+    strip names live in two places, simulation-processing's `KNOWN_*` lists
+    and these, and this fails when they disagree on a name a record uses.
+  - FAIL when minimal holds a residue of three atoms, one O and two H (or
+    D) by element: water under a name no list has. A .psf pair gives no
+    elements, so this needs the .pdb or .mmcif pair.
+  - WARN, when neither failed, when minimal keeps more than half of full's
+    atoms (`MINIMAL_SHARE_WARN`): solvent or lipids under unlisted names, or
+    an implicit-solvent or vacuum run, which has nothing to strip and is why
+    this does not fail. The warning reaches the submitter's warnings.
+  - Like every output check, a failure stops `process` before anything is
+    imported or pushed; `--skip-output-checks` is the override.
+    `minimal_lipid.*` keeps lipids on purpose and is not read.
+- `solute` and `solvent` read the full/minimal pair once (.pdb, else
+  .mmcif, else .psf).
+- Known disagreement this will now catch: `MINIMAL_DROPS` has `OHH` and
+  `T3H` (GROMACS's `residuetypes.dat` waters) and `KNOWN_WATER` does not,
+  so a cpptraj-path record using either name fails here until
+  simulation-processing strips them too.
+
 ## 0.41.3 (unreleased)
 
 - **One reader for a PDB record's x, y, z (`pdb_coords`), and every

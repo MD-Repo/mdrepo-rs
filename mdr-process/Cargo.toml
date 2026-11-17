@@ -1,6 +1,6 @@
 [package]
 name = "mdr-process"
-version = "0.41.3"
+version = "0.42.0"
 edition = "2024"
 
 [dependencies]
