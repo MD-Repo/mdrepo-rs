@@ -71,6 +71,7 @@
 //! MDAnalysis do) turns `NALA` into `ALA` but `CYSP` into `YSP`. Column 17 is
 //! the alternate-location flag in the standard; processed files never use it.
 
+use crate::pdb_coords;
 use anyhow::{Result, anyhow, bail};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -433,11 +434,6 @@ fn read_atoms(text: &str) -> Result<Vec<PdbAtom>> {
             continue;
         }
         let col = |a: usize, b: usize| line.get(a..b.min(line.len())).unwrap_or("");
-        let num = |a: usize, b: usize| -> Result<f64> {
-            col(a, b).trim().parse::<f64>().map_err(|e| {
-                anyhow!("line {}: columns {}-{}: {e}: {line:?}", i + 1, a + 1, b)
-            })
-        };
         let res_seq = col(22, 26)
             .trim()
             .parse::<i32>()
@@ -461,7 +457,7 @@ fn read_atoms(text: &str) -> Result<Vec<PdbAtom>> {
             chain_id: col(21, 22).trim().to_string(),
             res_seq,
             ins_code: col(26, 27).chars().next().unwrap_or(' '),
-            xyz: [num(30, 38)?, num(38, 46)?, num(46, 54)?],
+            xyz: pdb_coords::read_xyz_at(i, line)?,
         });
     }
     Ok(atoms)
@@ -1537,6 +1533,46 @@ mod tests {
             .filter(|l| l.starts_with("ATOM  ") || l.starts_with("HETATM"))
             .map(|l| l.chars().nth(21).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn an_overflowed_coordinate_is_rejected_with_why() {
+        // Verbatim from mdrepo-rs#89 (zenodo:13880099, line 132); such data
+        // is rejected (Travis, on #112)
+        let line = "ATOM     66  B     B    66       9.827 740.753********  1.00  \
+                    0.00           B  ";
+        let e = chains_from_text(&format!("{line}\nEND\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("line 1: columns 47-54: an overflowed coordinate"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_coordinate_is_an_error_naming_it() {
+        let mut line = atom(1, "CA", "MET", " ", 1, [0.0, 0.0, 0.0]);
+        line.replace_range(46..54, "  12.3ab");
+        let e = chains_from_text(&(line + "\nEND\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("line 1: columns 47-54: "), "{e}");
+    }
+
+    #[test]
+    fn coordinates_at_the_edge_of_the_field_read() {
+        let lines: Vec<String> = [[-999.999, 0.0, 0.0], [-996.199, 0.0, 0.0]]
+            .iter()
+            .zip(["MET", "ALA"])
+            .enumerate()
+            .map(|(i, (xyz, res))| {
+                atom(i as i32 + 1, "CA", res, " ", i as i32 + 1, *xyz)
+            })
+            .collect();
+        assert_eq!(fasta(&lines), ">_\nMA\n");
+        let far = vec![atom(1, "CA", "MET", " ", 1, [9999.999, 9999.999, 9999.999])];
+        assert_eq!(chains(&far).len(), 1);
     }
 
     #[test]

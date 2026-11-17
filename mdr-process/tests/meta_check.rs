@@ -19,7 +19,7 @@ const NO_SOFTWARE: &str = "tests/inputs/agent/8420199-no-software.toml";
 const TOP: &str = "tests/inputs/agent/top-without-coordinates.toml";
 const BROKEN: &str = "tests/inputs/agent/broken.toml";
 const MISMATCH: &str = "software_name is \"GROMACS\" but structure/topology/trajectory \
-    extensions (.pdb, .psf, .xtc, .xtc, .xtc) match ACEMD or CHARMM or NAMD instead";
+    extensions (\".pdb\", \".psf\", \".xtc\", \".xtc\", \".xtc\") match ACEMD or CHARMM or NAMD instead";
 
 /// stdout and stderr of `meta-check` with `args`; it must exit 0 whatever
 /// it finds, as mdrepo-agent expects

@@ -461,42 +461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chksum-core"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0475dc9fa905fe8feca5c4a48a97f65503ebd257a7566df1367d080083e160c6"
-dependencies = [
- "chksum-hash-core",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "chksum-hash-core"
-version = "0.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "221456234d441c788a2c51a27b91c4380f499de560670a67d3303e621d37b3bd"
-
-[[package]]
-name = "chksum-hash-md5"
-version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8445e9efb2556cedf4ef2bf704cb335cdd037ed20fe954f281baf93fe5e7c0d"
-dependencies = [
- "chksum-hash-core",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "chksum-md5"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dda0016624d188e791afdf491de89d0157411dafedb0a46dbcd3f1a13ef0a611"
-dependencies = [
- "chksum-core",
- "chksum-hash-md5",
-]
-
-[[package]]
 name = "chromiumoxide"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2064,7 +2028,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "diesel",
- "dotenvy",
  "serde",
  "serde_json",
  "utoipa",
@@ -2086,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "mdr-meta"
-version = "0.3.28"
+version = "0.3.31"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2095,18 +2058,16 @@ dependencies = [
  "predicates",
  "pretty_assertions",
  "self_update",
- "strum",
  "strum_macros",
  "tempfile",
 ]
 
 [[package]]
 name = "mdr-process"
-version = "0.41.0"
+version = "0.42.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "chksum-md5",
  "chrono",
  "clap",
  "csv",
@@ -2131,7 +2092,6 @@ dependencies = [
  "tar",
  "tempfile",
  "toml 1.1.8+spec-1.1.0",
- "urlencoding",
  "validator",
  "which 8.0.6",
 ]
@@ -3327,9 +3287,6 @@ name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
-dependencies = [
- "strum_macros",
-]
 
 [[package]]
 name = "strum_macros"

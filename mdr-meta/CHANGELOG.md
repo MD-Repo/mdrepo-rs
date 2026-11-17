@@ -4,9 +4,55 @@ Notable user-facing changes to `mdr-meta`. Each entry here becomes the
 GitHub release note for that version (see `.github/workflows/release.yml`)
 -- write it before tagging, not after.
 
-## Unreleased
+## 0.3.31
 
-Rename this heading to the version when tagging.
+### `mdr-meta spec` prints the spec's choices
+
+`mdr-meta spec` prints, as JSON, what the metadata file may contain where
+the spec fixes the choices: each software name with its versions, the water
+models, solute names, additional-file types and ligand sequence types, and
+the numeric ranges (temperature, timestep, frame spacing, water density,
+solute concentration). The website's forms read these instead of keeping
+their own copies.
+
+### CUSTOM files must be formats processing can read
+
+`software_name = "CUSTOM"` still needs no engine's usual combination of file
+formats, but each file must now be a format processing can read. A CUSTOM
+submission with `trajectory_file_names = ["a.boo"]` used to pass `check` and
+fail only after upload, when the trajectory could not be converted. Now:
+
+```
+trajectory_file_names[1]: ".boo" is not a trajectory format processing can read (crd, dcd, edr, mdc, mdcrd, nc, netcdf, trj, trr, xtc)
+```
+
+The same goes for the structure and topology. Every CUSTOM simulation in
+MDRepo so far (pdb/cor, psf, xtc/dcd/mdc) passes.
+
+## 0.3.30
+
+### File-format messages quote every extension
+
+The two messages about file formats now quote every extension, the
+trajectories' too:
+
+```
+File formats are incompatible: structure ".cif", topology ".top", trajectory ".xtc", ".foo" match no supported engine's convention
+```
+
+Before, the trajectories were bare (`trajectory .xtc, .foo`), and the
+"software_name ... match ... instead" message quoted none of its three.
+
+## 0.3.29
+
+0.3.28 was never released; this includes its changes.
+
+### A fractional integration timestep is accepted
+
+`integration_timestep_fs` can now be a fraction, such as `2.5`. 0.3.27 read it
+as a whole number and refused a file with `2.5`, though import has taken one
+since 2026-10-28 (mdrepo-rs#50). The range is still 1-20 fs, and `= 2` still
+reads as before. `mdr-meta eg`, `gen` and `to-toml` now write it as `2.0`.
 
 ### A missing temperature, software or ORCID names the field
 

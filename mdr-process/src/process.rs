@@ -31,7 +31,7 @@ use std::{
     io::{Read, Write},
     os::unix::process::CommandExt,
     path::{self, Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{self, Instant},
 };
@@ -1538,7 +1538,13 @@ pub fn standardize(
             match standardize_mmcif(
                 server, sim_id, out_dir, &full_pdb, &min_pdb, script_dir, uv,
             ) {
-                Ok((counts, unplaced, by_connectivity, refs)) => {
+                Ok((counts, unplaced, by_connectivity, refs, residues_from)) => {
+                    if residues_from == "full" {
+                        warnings.push(
+                            "mmCIF: minimal.pdb holds no ligand; ligand residue names taken from full.pdb"
+                                .to_string(),
+                        );
+                    }
                     for name in &unplaced {
                         warnings.push(format!(
                             "mmCIF: ligand {name:?} matches no residue by InChIKey or connectivity; written without its identity"
@@ -1550,6 +1556,7 @@ pub fn standardize(
                         "links": counts.num_links,
                         "references": refs,
                         "ligands_unplaced": unplaced.len(),
+                        "ligand_residues_from": residues_from,
                         "ligands_by_connectivity": by_connectivity
                             .iter()
                             .map(|(name, resname)| serde_json::json!({"ligand": name, "residue": resname}))
@@ -1634,7 +1641,8 @@ pub fn standardize(
 /// (`mmcif_input_from_db`), each ligand's residue name from mol_id.py's
 /// structure step, the links from `out_dir/bonds.tsv`. Returns the full
 /// file's counts, the ligands left unplaced, those placed by connectivity
-/// (name, residue), and the number of UniProt ranges.
+/// (name, residue), the number of UniProt ranges, and where the ligands'
+/// residue names came from ([`ligand_residues_min_or_full`]).
 fn standardize_mmcif(
     server: &Server,
     sim_id: i64,
@@ -1648,6 +1656,7 @@ fn standardize_mmcif(
     Vec<String>,
     PlacedByConnectivity,
     usize,
+    &'static str,
 )> {
     let env_key = dsn_for(server);
     let url = env::var(env_key).map_err(|e| anyhow!("{env_key}: {e}"))?;
@@ -1656,15 +1665,16 @@ fn standardize_mmcif(
     let title = mdr_db::ops::get_simulation(&mut conn, sim_id)?.short_description;
     let (_, stored) =
         mdr_db::ops::list_ligands(&mut conn, None, Some(sim_id), true, None, None)?;
-    // mol_id.py finding no ligand (MDR00020024's minimal.pdb lacks it,
-    // MDR-109) costs the ligands' identities, not the file
-    let residues = if stored.iter().any(|l| l.smiles.is_some()) {
-        ligand_resnames(min_pdb, script_dir, uv).unwrap_or_else(|e| {
-            warn!("mmCIF: no ligand residue names: {e}");
-            LigandResidues::default()
+    // mol_id.py finding no ligand in minimal.pdb (MISATO's MOL was stripped
+    // from minimal 2025-10-14..2026-04-29; MDR00020024, MDR-109) falls back
+    // to full.pdb; finding none in either costs the ligands' identities,
+    // not the file
+    let (residues, residues_from) = if stored.iter().any(|l| l.smiles.is_some()) {
+        ligand_residues_min_or_full(min_pdb, full_pdb, &mut |pdb| {
+            ligand_resnames(pdb, script_dir, uv)
         })
     } else {
-        LigandResidues::default()
+        (LigandResidues::default(), "not needed")
     };
     let (input, unplaced, by_connectivity, _) =
         mmcif_input_from_db(&mut conn, sim_id, &title, &residues, &mut |a, b| {
@@ -1680,7 +1690,39 @@ fn standardize_mmcif(
         &out_dir.join("minimal.mmcif"),
         &input,
     )?;
-    Ok((full, unplaced, by_connectivity, refs))
+    Ok((full, unplaced, by_connectivity, refs, residues_from))
+}
+
+// --------------------------------------------------
+/// The ligands' residue names from `min_pdb`, or from `full_pdb` when
+/// `min_pdb` yields none (or cannot be read), and which one: "minimal",
+/// "full", or "none" when neither has a ligand. minimal.pdb is tried
+/// first: it is smaller (no solvent) and is what imports have always used.
+/// `find` is [`ligand_resnames`] outside tests.
+pub fn ligand_residues_min_or_full(
+    min_pdb: &Path,
+    full_pdb: &Path,
+    find: &mut dyn FnMut(&Path) -> Result<LigandResidues>,
+) -> (LigandResidues, &'static str) {
+    let mut tried = |pdb: &Path, label: &str| match find(pdb) {
+        Ok(r) if !r.resname_of.is_empty() => Some(r),
+        Ok(_) => {
+            debug!("mmCIF: no ligand residue in {label}");
+            None
+        }
+        Err(e) => {
+            warn!("mmCIF: no ligand residue names from {label}: {e}");
+            None
+        }
+    };
+    if let Some(r) = tried(min_pdb, "minimal.pdb") {
+        return (r, "minimal");
+    }
+    if let Some(r) = tried(full_pdb, "full.pdb") {
+        warn!("mmCIF: minimal.pdb holds no ligand; residue names from full.pdb");
+        return (r, "full");
+    }
+    (LigandResidues::default(), "none")
 }
 
 // --------------------------------------------------
@@ -4350,11 +4392,11 @@ fn run_helper(cmd: &mut Command, what: &str) -> Result<()> {
 // --------------------------------------------------
 /// `Command::output`, but giving up after `limit` and returning `None`.
 ///
-/// The child gets a process group of its own and the whole group is killed:
-/// the cpptraj wrapper treats a dead `cpptraj` as non-fatal and hangs again
-/// at its next stage, so killing only one of them never ends the job. The
-/// cost is that a Ctrl-C at the terminal no longer reaches the group; stop a
-/// manual run's conversion by its group id (`kill -- -<pgid>`).
+/// The child gets a process group of its own and the whole group is stopped
+/// (`stop_group`): the cpptraj wrapper treats a dead `cpptraj` as non-fatal
+/// and hangs again at its next stage, so stopping only one of them never ends
+/// the job. The cost is that a Ctrl-C at the terminal no longer reaches the
+/// group; stop a manual run's conversion by its group id (`kill -- -<pgid>`).
 fn output_with_timeout(
     cmd: &mut Command,
     limit: time::Duration,
@@ -4387,10 +4429,7 @@ fn output_with_timeout(
     };
 
     let Some(status) = status else {
-        // A negative pid addresses the group, whose id is the child's pid.
-        let group = format!("-{}", child.id());
-        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
-        let _ = child.wait();
+        stop_group(&mut child, STOP_GRACE);
         // Both readers finish once every process holding the pipes is dead.
         let _ = (stdout.join(), stderr.join());
         return Ok(None);
@@ -4406,6 +4445,48 @@ fn output_with_timeout(
         stdout: collect(stdout)?,
         stderr: collect(stderr)?,
     }))
+}
+
+/// How long a timed-out child's process group gets to exit after SIGTERM
+/// before whatever is left is killed.
+const STOP_GRACE: time::Duration = time::Duration::from_secs(10);
+
+// --------------------------------------------------
+/// End a timed-out child's process group: SIGTERM, then SIGKILL for anything
+/// still running after `grace`.
+///
+/// SIGTERM first lets a process clean up after itself. Xvfb, which
+/// create_preview.py starts for every thumbnail, removes its
+/// `/tmp/.X<N>-lock` and socket on SIGTERM and leaves both on SIGKILL
+/// (checked on md-process-2, 2026-11-16). When this sent SIGKILL alone, every
+/// thumbnail killed at the helper limit left a lock, create_preview.py skips
+/// a display whose lock exists, and the 101 numbers it tries (99-199) ran
+/// out: on 6 Nov about 160 systems failed with "No free display number found
+/// for Xvfb" (simulation-processing#33). SIGKILL still follows, which is what
+/// ends a wrapper that ignores SIGTERM.
+fn stop_group(child: &mut Child, grace: time::Duration) {
+    // A negative pid addresses the group, whose id is the child's pid.
+    let group = format!("-{}", child.id());
+    let signal = |sig: &str| {
+        Command::new("kill")
+            .args([sig, "--", &group])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    signal("-TERM");
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        // Reap the leader as it exits: a zombie still counts as a member,
+        // and the group would never look empty.
+        let _ = child.try_wait();
+        if !signal("-0") {
+            break;
+        }
+        thread::sleep(time::Duration::from_millis(100));
+    }
+    signal("-KILL");
+    let _ = child.wait();
 }
 
 /// For tests that run simulation-processing's Python scripts: can `uv` build
@@ -6430,6 +6511,75 @@ mol_id: No ligand-like residue found in minimal.pdb
         assert!(!alive, "the grandchild (pid {}) survived", pid.trim());
     }
 
+    #[test]
+    fn output_with_timeout_lets_the_group_clean_up_first() {
+        // Xvfb's shape: a grandchild that removes its lock on SIGTERM. Sent
+        // SIGKILL alone it never could (simulation-processing#33).
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("X150-lock");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sh -c 'trap \"rm -f {0}; exit 0\" TERM; touch {0}; \
+             while :; do sleep 1; done' & wait",
+            lock.display()
+        ));
+
+        let out = output_with_timeout(&mut cmd, time::Duration::from_secs(1)).unwrap();
+        assert!(out.is_none(), "should time out");
+        assert!(
+            !lock.exists(),
+            "the lock was left: the group got no SIGTERM"
+        );
+    }
+
+    #[test]
+    fn stop_group_kills_what_ignores_sigterm() {
+        // The cpptraj wrapper's shape: something that outlives SIGTERM still
+        // has to be gone once the grace period is over.
+        let dir = tempdir().unwrap();
+        let pidfile = dir.path().join("stubborn.pid");
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & \
+                 echo $! > {}; wait",
+                pidfile.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        while !pidfile.exists() {
+            thread::sleep(time::Duration::from_millis(20));
+        }
+        thread::sleep(time::Duration::from_millis(200)); // let the trap be set
+
+        let start = Instant::now();
+        stop_group(&mut child, time::Duration::from_secs(1));
+        assert!(start.elapsed() < time::Duration::from_secs(5));
+
+        // SIGKILL is delivered at once, but the pid lingers until it is
+        // reaped, and its parent (the group leader) is dead too, so init
+        // reaps it whenever it gets to it. `kill -0` succeeds on a zombie, so
+        // wait briefly for the pid to be gone or a zombie: either is dead.
+        let pid = fs::read_to_string(&pidfile).unwrap();
+        let pid = pid.trim();
+        let deadline = Instant::now() + time::Duration::from_secs(2);
+        let mut dead = false;
+        while Instant::now() < deadline {
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout);
+            if stat.trim().is_empty() || stat.trim_start().starts_with('Z') {
+                dead = true;
+                break;
+            }
+            thread::sleep(time::Duration::from_millis(20));
+        }
+        assert!(dead, "pid {pid} outlived the grace period");
+    }
+
     // ── helper-script time limit ──────────────────────────────────────────
     #[test]
     fn timeout_from_env_uses_the_default_when_unset() {
@@ -7154,6 +7304,106 @@ mod place_ligands_tests {
             checked += 1;
         }
         assert_eq!(checked, 21);
+    }
+
+    // --- ligand_residues_min_or_full -----------------------------------------
+
+    /// A finder answering per file name, recording what it was asked
+    fn finder<'a>(
+        answers: &'a [(&'a str, Result<LigandResidues, &'a str>)],
+        asked: &'a RefCell<Vec<String>>,
+    ) -> impl FnMut(&std::path::Path) -> Result<LigandResidues> + 'a {
+        move |p| {
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            asked.borrow_mut().push(name.clone());
+            match answers.iter().find(|(n, _)| *n == name) {
+                Some((_, Ok(r))) => Ok(r.clone()),
+                Some((_, Err(e))) => bail!("{e}"),
+                None => bail!("no such file"),
+            }
+        }
+    }
+
+    fn mol() -> LigandResidues {
+        residues(&[(NAP_KEY, "MOL", "c1ccccc1")])
+    }
+
+    fn min_or_full(
+        answers: &[(&str, Result<LigandResidues, &str>)],
+    ) -> (LigandResidues, &'static str, Vec<String>) {
+        let asked = RefCell::new(vec![]);
+        let mut f = finder(answers, &asked);
+        let (r, from) = super::ligand_residues_min_or_full(
+            &PathBuf::from("minimal.pdb"),
+            &PathBuf::from("full.pdb"),
+            &mut f,
+        );
+        drop(f);
+        (r, from, asked.into_inner())
+    }
+
+    #[test]
+    fn residues_from_minimal_when_it_has_the_ligand() {
+        let (r, from, asked) =
+            min_or_full(&[("minimal.pdb", Ok(mol())), ("full.pdb", Ok(mol()))]);
+        assert_eq!((from, r), ("minimal", mol()));
+        assert_eq!(asked, vec!["minimal.pdb"]); // full.pdb not read
+    }
+
+    #[test]
+    fn residues_from_full_when_minimal_lost_the_ligand() {
+        // MISATO: MOL stripped from minimal.pdb, present in full.pdb
+        let (r, from, asked) = min_or_full(&[
+            ("minimal.pdb", Ok(LigandResidues::default())),
+            ("full.pdb", Ok(mol())),
+        ]);
+        assert_eq!((from, r), ("full", mol()));
+        assert_eq!(asked, vec!["minimal.pdb", "full.pdb"]);
+    }
+
+    #[test]
+    fn residues_from_full_when_minimal_fails() {
+        // mol_id.py exits non-zero on a structure with no ligand-like residue
+        let (r, from, _) = min_or_full(&[
+            ("minimal.pdb", Err("No ligand-like residue found")),
+            ("full.pdb", Ok(mol())),
+        ]);
+        assert_eq!((from, r), ("full", mol()));
+    }
+
+    #[test]
+    fn residues_none_when_neither_has_a_ligand() {
+        let (r, from, asked) = min_or_full(&[
+            ("minimal.pdb", Err("No ligand-like residue found")),
+            ("full.pdb", Ok(LigandResidues::default())),
+        ]);
+        assert_eq!((from, r), ("none", LigandResidues::default()));
+        assert_eq!(asked.len(), 2);
+    }
+
+    #[test]
+    fn residues_none_when_both_fail() {
+        let (r, from, _) =
+            min_or_full(&[("minimal.pdb", Err("boom")), ("full.pdb", Err("boom"))]);
+        assert_eq!((from, r), ("none", LigandResidues::default()));
+    }
+
+    #[test]
+    fn residues_from_full_place_the_ligand() {
+        // the fallback's names place a stored ligand by its InChIKey, as
+        // minimal's would have
+        let (r, from, _) = min_or_full(&[
+            ("minimal.pdb", Ok(LigandResidues::default())),
+            ("full.pdb", Ok(mol())),
+        ]);
+        assert_eq!(from, "full");
+        let out = place(
+            vec![stored("lig", Some("c1ccccc1"), Some(NAP_KEY))],
+            &r,
+            &Stub::new(&[]),
+        );
+        assert!(out.unplaced.is_empty(), "{:?}", out.unplaced);
+        assert_eq!(out.ligands.len(), 1);
     }
 }
 

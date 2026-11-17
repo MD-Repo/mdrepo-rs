@@ -11,7 +11,7 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   database or iRODS, or in its command line;
 - **patch** (0.2.0 -> 0.2.1) for everything else.
 
-## 0.41.0 (unreleased)
+## 0.42.0 (unreleased)
 
 Ligand chemistry (review F2-F5), as decided 2026-11-12. Needs
 simulation-processing's `ligand-chemistry` change for all but the first
@@ -49,6 +49,58 @@ hydrogens and an older `mol_id.py` no peptides, and both are read as before.
   charges 0 to +-6, and nothing for a glycan or a lipid written as several
   residues. A rerun recomputes `inferred_ligands.json` because the script's
   hash changed (0.19.0).
+
+## 0.41.3 (unreleased)
+
+- **One reader for a PDB record's x, y, z (`pdb_coords`), and every
+  coordinate must parse.** Four readers had their own rule: sequence and
+  `check-outputs` stopped, but the psf and mmCIF writers read a coordinate
+  that did not parse as 0.0 and wrote that position out. All four now call
+  `pdb_coords::read_xyz`; a bad coordinate is an error naming the line and
+  columns. Today sequence extraction (and `residue_layout` inside the
+  mmCIF writer) stops such a file first, so no 0.0 reached a written file;
+  this keeps it that way if that ever changes (as #112 would have).
+- **An overflowed coordinate (`********`) is rejected with a message that
+  says so** ("an overflowed coordinate ...: the value does not fit the PDB
+  format (-999.999 to 9999.999 A)"), not "invalid float literal". Such data
+  is rejected, not read (Travis, on #112; #89).
+- Not detected: a C-style writer prints the wider number (`10000.500`),
+  which shifts every later column.
+
+## 0.41.2 (unreleased)
+
+- **A helper killed at its time limit gets SIGTERM before SIGKILL.** The
+  thumbnail, RMSD/RMSF and conversion limits killed the helper's whole
+  process group with SIGKILL, so Xvfb, which create_preview.py starts, could
+  not remove its `/tmp/.X<N>-lock`. create_preview.py skips a display whose
+  lock exists, and once displays 99-199 were all taken every preview failed
+  ("No free display number found for Xvfb"; about 160 systems on 6 Nov,
+  simulation-processing#33). The group now gets SIGTERM and up to 10 s to
+  exit, and SIGKILL after that. Locks already left behind still have to be
+  deleted once.
+
+## 0.41.0 (unreleased)
+
+- **New output check, `solute`: minimal must keep every residue full has**
+  except water, the stripped ions (NA, CL, K, SOD, CLA, Na+, Cl-, K+, MG,
+  Mg2+) and lipids, and as many of each; otherwise FAIL, which stops an
+  import. Found 2026-11-13: from 2025-10-14 to 2026-04-29 the GROMACS path
+  stripped residue `MOL` from minimal (utils de9bc0f, undone in 0e0ae26),
+  so the 16,149 MISATO sims were released with no ligand in minimal.pdb,
+  minimal.xtc and sampled.xtc (MDR00015163: full 5,146 atoms, minimal
+  5,136). The atom check could not see it: it compares the files within
+  the full set and within the minimal set, not the two sets. Uses the
+  .pdb pair, else .mmcif, else .psf.
+- **`standardize` takes ligand residue names from full.pdb when minimal.pdb
+  has none.** It read only minimal.pdb, so with the ligand stripped every
+  MISATO ligand was left unplaced and its mmCIF written without its
+  identity (MDR-108 b01-b03: 0 of 12,640 ligand rows placed). report.json's
+  `mmcif` gains `ligand_residues_from` ("minimal", "full", "none" or "not
+  needed"), and a warning says when full.pdb was used. MDR00015163 and
+  MDR00012929 now place their ligand (6XA, 1D9).
+- Toolchain note: Rust 1.100.0 warns about three unused dependencies
+  (`chksum-md5`, `tempfile`, `urlencoding`) on main as well; not changed
+  here.
 
 ## 0.40.0 (unreleased)
 
@@ -211,6 +263,44 @@ Install it on a host only after 0303 is deployed to that host's database.
   be left out. mdrepo-agent asked for it (mdrepo-agent#105) so its pre-push
   gate no longer has to drop validate's errors that meta-check does not
   raise.
+
+## 0.32.0 (unreleased)
+
+- **The mmCIF writer places a ligand by InChI connectivity when its InChIKey
+  misses** (#85, MDR-110). It tries the InChIKey, then the key's first block,
+  then the `/c` layer (`compare_smiles.py`'s `same_connectivity`, the test
+  `resolve_ligands` already uses) against each residue `mol_id.py` found,
+  placing the ligand only when exactly one residue name matches. A cofactor
+  stored neutral but simulated protonated (NADP, FAD, ATP, CoA, ...) now gets
+  its identity in the mmCIF. Connectivity ignores stereo. The ligand keeps
+  its own stored SMILES and InChIKey; a ligand with no InChIKey is not
+  compared, and a failed comparison counts as no match.
+- `mmcif-input.json` gains `smiles_of` (older files still load and place by
+  key only); `standardize`'s report adds `ligands_by_connectivity`; the
+  unplaced warning says "by InChIKey or connectivity".
+
+## 0.31.0 (unreleased)
+
+- **`process --agent-imported` and `meta-check --agent-imported`**, for
+  simulations an AI agent (mdrepo-agent) imports (#84, #46). The flag sets
+  `md_simulation.is_agent_imported` (md-repo-app 0302) and files the
+  simulation under `mdrepo_admin`. The TOML may leave out
+  `lead_contributor_orcid`, `temperature_kelvin` and the software (name and
+  version together, or neither); no software is stored as NULL, not CUSTOM.
+  `integration_timestep_fs` stays required. A format set that does not fit
+  the declared engine is a warning when processing can read every file;
+  a topology with no trajectory path, a format no engine uses, and a
+  GROMACS `.top` with no `.tpr`/`.gro` stay errors. A reprocess never clears
+  the flag. Without the flag nothing is relaxed.
+- **`meta-check --json`** prints one object (`ok`, `errors`, `warnings`;
+  each finding has `level`, `field`, `code`, `message`), with the log on
+  stderr. `code` names the rule (`required`, `range`, `format_mismatch`,
+  `gromacs_top_needs_coordinates`, `parse`) and stays fixed if the wording
+  changes. It still exits 0; the text output is unchanged.
+- A person's TOML missing one of those four fields now gets a `required`
+  error naming the field (e.g. `temperature_kelvin: required`) instead of a
+  TOML parse error; all four are still required for people. libmdrepo's `Meta` holds them as
+  `Option`s; the public export's `Summary` carries `is_agent_imported`.
 
 ## 0.30.0 (unreleased)
 
