@@ -1040,7 +1040,8 @@ pub fn write_mmcifs(
 ) -> Result<(MmcifCounts, MmcifCounts)> {
     let full_text = fs::read_to_string(full_pdb)?;
     let min_text = fs::read_to_string(min_pdb)?;
-    let full_atoms = psf_writer::read_pdb(&full_text);
+    let full_atoms = psf_writer::read_pdb(&full_text)
+        .map_err(|e| anyhow!("{}: {e}", full_pdb.display()))?;
     let bonds = match bonds_tsv {
         Some(p) => psf_writer::read_bonds(&fs::read_to_string(p)?, full_atoms.len())?,
         None => vec![],
@@ -1048,7 +1049,8 @@ pub fn write_mmcifs(
     let min_bonds = if bonds.is_empty() {
         vec![]
     } else {
-        let min_atoms = psf_writer::read_pdb(&min_text);
+        let min_atoms = psf_writer::read_pdb(&min_text)
+            .map_err(|e| anyhow!("{}: {e}", min_pdb.display()))?;
         let in_full = psf_writer::find_in_full(&min_atoms, &full_atoms)
             .map_err(|e| anyhow!("{}: {e}", min_pdb.display()))?;
         let to_min: HashMap<usize, usize> =

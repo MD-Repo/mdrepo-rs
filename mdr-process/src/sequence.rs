@@ -250,10 +250,16 @@ impl Residue {
             }
             _ => return,
         };
-        // First one wins
-        if slot.is_none() {
+        // First one wins, unless it has no position and a later copy does
+        // (an alternate location or a duplicate atom)
+        if matches!(slot, None | Some(None)) {
             *slot = Some(atom.xyz);
         }
+    }
+
+    /// A backbone atom is present but its position is unknown
+    fn has_unplaced(&self) -> bool {
+        [self.n, self.ca, self.c, self.p, self.o3].contains(&Some(None))
     }
 
     /// A nucleotide by name or by its sugar
@@ -444,7 +450,9 @@ fn read_atoms(text: &str) -> Result<Vec<PdbAtom>> {
         // 9999.999) with asterisks: the position is lost, not malformed.
         // zenodo:13880099's center-of-mass beads, unwrapped across an 1880 A
         // cell, failed the whole import here (mdrepo-rs#89). Anything else
-        // that does not parse is still an error.
+        // that does not parse is still an error. Only this Fortran-style
+        // overflow is caught: a C-style writer prints the wider number
+        // (`10000.500`), which shifts every later column and is not detected.
         let num = |a: usize, b: usize| -> Result<Option<f64>> {
             let field = col(a, b).trim();
             if !field.is_empty() && field.chars().all(|c| c == '*') {
@@ -504,7 +512,14 @@ fn residues(atoms: &[PdbAtom]) -> Vec<Residue> {
 
 /// Does `cur` continue the chain that `prev` is in? The rules in the module
 /// docs.
-fn joins(cell: Option<&Cell>, prev: &Residue, cur: &Residue) -> bool {
+/// `unplaced` counts the joins the numbering decided only because a
+/// backbone position was unknown (an overflowed coordinate).
+fn joins(
+    cell: Option<&Cell>,
+    prev: &Residue,
+    cur: &Residue,
+    unplaced: &mut usize,
+) -> bool {
     if prev.chain_id != cur.chain_id {
         return false;
     }
@@ -551,7 +566,12 @@ fn joins(cell: Option<&Cell>, prev: &Residue, cur: &Residue) -> bool {
     }
     match (prev.ca.flatten(), cur.ca.flatten()) {
         (Some(a), Some(b)) => distance_in(cell, a, b) <= MAX_CA_CA,
-        _ => true,
+        _ => {
+            if prev.has_unplaced() || cur.has_unplaced() {
+                *unplaced += 1;
+            }
+            true
+        }
     }
 }
 
@@ -610,11 +630,13 @@ impl Structure {
 
         let mut runs: Vec<&[usize]> = vec![];
         let mut start = 0;
+        let mut unplaced = 0;
         for i in 1..polymer.len() {
             if !joins(
                 cell.as_ref(),
                 &residues[polymer[i - 1]],
                 &residues[polymer[i]],
+                &mut unplaced,
             ) {
                 runs.push(&polymer[start..i]);
                 start = i;
@@ -622,6 +644,13 @@ impl Structure {
         }
         if start < polymer.len() {
             runs.push(&polymer[start..]);
+        }
+        if unplaced > 0 {
+            log::warn!(
+                "{unplaced} residue joins decided by the numbering alone: a \
+                 backbone position is unknown (overflowed coordinate), so a \
+                 chain break there would be missed"
+            );
         }
 
         let mut chains = vec![];
@@ -1767,28 +1796,210 @@ mod tests {
         assert_eq!(got[0].breaks, Vec::<usize>::new());
     }
 
+    /// CA beads `names` numbered `nums`, at `xs` along x
+    fn beads(names: &[&str], nums: &[i32], xs: &[f64]) -> Vec<String> {
+        (0..names.len())
+            .map(|i| {
+                atom(
+                    i as i32 + 1,
+                    "CA",
+                    names[i],
+                    " ",
+                    nums[i],
+                    [xs[i], 0.0, 0.0],
+                )
+            })
+            .collect()
+    }
+
+    /// Overwrite one coordinate field (0 = x, 1 = y, 2 = z) with asterisks
+    fn overflow(line: &mut String, axis: usize) {
+        line.replace_range(30 + 8 * axis..38 + 8 * axis, "********");
+    }
+
     #[test]
     fn an_overflowed_coordinate_is_an_unknown_position() {
         // zenodo:13880099 (mdrepo-rs#89): center-of-mass beads unwrapped
         // across an 1880 A cell, and a z the writer could not fit filled
         // with asterisks. The bead reads as unplaced and the numbering
-        // decides, as for a bead with no position at all.
+        // decides, as for a bead with no position at all. Bead 3 sits 50 A
+        // from bead 1, so only the numbering can join all three: had the
+        // unknown z been read as 0.0, bead 2 (x 3.8) would be 46 A from
+        // bead 3 and the chain would split.
+        let mut lines = beads(&["MET", "ALA", "LYS"], &[1, 2, 3], &[0.0, 3.8, 50.0]);
+        overflow(&mut lines[1], 2);
+        assert_eq!(fasta(&lines), ">_\nMAK\n");
+    }
+
+    #[test]
+    fn the_same_beads_without_the_overflow_split_on_distance() {
+        // The control for the test above: with bead 2 placed, distance decides
+        let lines = beads(&["MET", "ALA", "LYS"], &[1, 2, 3], &[0.0, 3.8, 50.0]);
+        let got = chains(&lines);
+        assert!(got.iter().all(|c| c.residues.len() < 3), "{got:?}");
+    }
+
+    #[test]
+    fn an_overflowed_x_or_y_is_unknown_too() {
+        for axis in 0..3 {
+            let mut lines = beads(&["MET", "ALA"], &[1, 2], &[0.0, 3.8]);
+            overflow(&mut lines[0], axis);
+            let atoms = read_atoms(&lines.join("\n")).unwrap();
+            assert_eq!(atoms[0].xyz, None, "axis {axis}");
+            assert_eq!(atoms[1].xyz, Some([3.8, 0.0, 0.0]));
+        }
+    }
+
+    #[test]
+    fn the_line_from_issue_89_reads() {
+        // Verbatim from mdrepo-rs#89 (zenodo:13880099, line 132)
+        let line = "ATOM     66  B     B    66       9.827 740.753********  1.00  \
+                    0.00           B  ";
+        let atoms = read_atoms(line).unwrap();
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(atoms[0].res_seq, 66);
+        assert_eq!(atoms[0].xyz, None);
+        assert!(chains_from_text(&format!("{line}\nEND\n")).is_ok());
+    }
+
+    #[test]
+    fn a_numbering_gap_beside_an_unplaced_bead_still_joins() {
+        // A jump in the numbering (a missing loop) joins whatever the
+        // positions; the overflow does not change that
+        let mut lines = beads(&["MET", "ALA", "LYS"], &[1, 2, 5], &[0.0, 3.8, 7.6]);
+        overflow(&mut lines[1], 2);
+        assert_eq!(fasta(&lines), ">_\nMAK\n");
+    }
+
+    #[test]
+    fn backwards_numbering_beside_an_unplaced_bead_still_splits() {
+        let mut lines = beads(&["MET", "ALA", "LYS"], &[1, 2, 1], &[0.0, 3.8, 7.6]);
+        overflow(&mut lines[1], 2);
+        let got = chains(&lines);
+        assert!(got.iter().all(|c| c.residues.len() < 3), "{got:?}");
+    }
+
+    #[test]
+    fn a_chain_id_change_beside_an_unplaced_bead_still_splits() {
         let mut lines: Vec<String> = ["MET", "ALA", "LYS"]
             .iter()
+            .zip(["A", "A", "B"])
             .enumerate()
-            .map(|(i, res)| {
-                atom(
-                    i as i32 + 1,
-                    "CA",
-                    res,
-                    " ",
-                    i as i32 + 1,
-                    [3.8 * i as f64, 0.0, 0.0],
-                )
+            .map(|(i, (res, ch))| {
+                let i = i as i32;
+                atom(i + 1, "CA", res, ch, i + 1, [3.8 * i as f64, 0.0, 0.0])
             })
             .collect();
-        lines[1].replace_range(46..54, "********");
+        overflow(&mut lines[2], 0);
+        let got = chains(&lines);
+        assert_eq!(
+            got.iter().map(|c| c.residues.len()).max(),
+            Some(2),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_later_placed_copy_replaces_an_unplaced_one() {
+        // Two CA records for residue 2: the first overflowed, the second at
+        // x 50. The placed copy is used, so 1-2 is 50 A apart and splits.
+        let mut lines = beads(
+            &["MET", "ALA", "ALA", "LYS"],
+            &[1, 2, 2, 3],
+            &[0.0, 3.8, 50.0, 53.8],
+        );
+        overflow(&mut lines[1], 2);
+        let res = residues(&read_atoms(&lines.join("\n")).unwrap());
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[1].ca, Some(Some([50.0, 0.0, 0.0])));
+        let got = chains(&lines);
+        assert!(got.iter().all(|c| c.residues.len() < 3), "{got:?}");
+    }
+
+    #[test]
+    fn a_placed_first_copy_is_kept_over_a_later_unplaced_one() {
+        let mut lines = beads(
+            &["MET", "ALA", "ALA", "LYS"],
+            &[1, 2, 2, 3],
+            &[0.0, 3.8, 50.0, 7.6],
+        );
+        overflow(&mut lines[2], 2);
+        let res = residues(&read_atoms(&lines.join("\n")).unwrap());
+        assert_eq!(res[1].ca, Some(Some([3.8, 0.0, 0.0])));
         assert_eq!(fasta(&lines), ">_\nMAK\n");
+    }
+
+    #[test]
+    fn the_first_placed_copy_still_wins() {
+        let lines = beads(&["MET", "ALA", "ALA"], &[1, 2, 2], &[0.0, 3.8, 50.0]);
+        let res = residues(&read_atoms(&lines.join("\n")).unwrap());
+        assert_eq!(res[1].ca, Some(Some([3.8, 0.0, 0.0])));
+    }
+
+    /// Two all-atom ALA (N, CA, C) numbered 10 and 11, the second starting at
+    /// `x1`, so C(10)-N(11) is bonded at 3.8 and broken at 50
+    fn two_all_atom(x1: f64) -> Vec<String> {
+        let mut s = 0;
+        let mut lines = backbone(&mut s, "ALA", "A", 10, 0.0);
+        lines.extend(backbone(&mut s, "ALA", "A", 11, x1));
+        lines
+    }
+
+    fn join_of(lines: &[String]) -> (bool, usize) {
+        let res = residues(&read_atoms(&lines.join("\n")).unwrap());
+        assert_eq!(res.len(), 2);
+        let mut unplaced = 0;
+        let joined = joins(None, &res[0], &res[1], &mut unplaced);
+        (joined, unplaced)
+    }
+
+    #[test]
+    fn an_unplaced_c_falls_back_to_the_ca_distance() {
+        // A real break 50 A wide: C(10) unknown, but both CA known, so the
+        // CA distance still finds it and nothing is counted
+        let mut lines = two_all_atom(50.0);
+        overflow(&mut lines[2], 0);
+        assert_eq!(join_of(&lines), (false, 0));
+    }
+
+    #[test]
+    fn an_unplaced_c_and_ca_leave_the_numbering_and_are_counted() {
+        // The case a reader cannot settle: the break is missed, and counted
+        // so `Structure::read` warns
+        let mut lines = two_all_atom(50.0);
+        overflow(&mut lines[2], 0); // C(10)
+        overflow(&mut lines[4], 0); // CA(11)
+        assert_eq!(join_of(&lines), (true, 1));
+    }
+
+    #[test]
+    fn a_bonded_pair_is_not_counted() {
+        assert_eq!(join_of(&two_all_atom(3.8)), (true, 0));
+    }
+
+    #[test]
+    fn beads_with_no_backbone_are_not_counted() {
+        // Ordinary CA beads join on the numbering when one has no CA at all;
+        // that is not an overflow and must not warn
+        let res = residues(
+            &read_atoms(&beads(&["MET", "ALA"], &[1, 2], &[0.0, 3.8]).join("\n"))
+                .unwrap(),
+        );
+        let mut unplaced = 0;
+        assert!(joins(None, &res[0], &res[1], &mut unplaced));
+        assert_eq!(unplaced, 0);
+        assert!(!res[0].has_unplaced());
+    }
+
+    #[test]
+    fn has_unplaced_sees_any_backbone_atom() {
+        for i in 0..3 {
+            let mut lines = two_all_atom(3.8);
+            overflow(&mut lines[i], 1);
+            let res = residues(&read_atoms(&lines.join("\n")).unwrap());
+            assert!(res[0].has_unplaced(), "atom {i}");
+            assert!(!res[1].has_unplaced());
+        }
     }
 
     #[test]
@@ -1796,6 +2007,23 @@ mod tests {
         let mut line = atom(1, "CA", "MET", " ", 1, [0.0, 0.0, 0.0]);
         line.replace_range(46..54, "  12.3ab");
         assert!(chains_from_text(&(line + "\nEND\n")).is_err());
+    }
+
+    #[test]
+    fn a_part_asterisk_coordinate_is_an_error() {
+        // Only a whole field of asterisks is an overflow
+        let mut line = atom(1, "CA", "MET", " ", 1, [0.0, 0.0, 0.0]);
+        line.replace_range(46..54, "  ***.12");
+        assert!(chains_from_text(&(line + "\nEND\n")).is_err());
+    }
+
+    #[test]
+    fn a_blank_or_cut_off_coordinate_is_an_error() {
+        let mut blank = atom(1, "CA", "MET", " ", 1, [0.0, 0.0, 0.0]);
+        blank.replace_range(46..54, "        ");
+        assert!(chains_from_text(&(blank + "\nEND\n")).is_err());
+        let cut = atom(1, "CA", "MET", " ", 1, [0.0, 0.0, 0.0])[..46].to_string();
+        assert!(chains_from_text(&(cut + "\nEND\n")).is_err());
     }
 
     #[test]

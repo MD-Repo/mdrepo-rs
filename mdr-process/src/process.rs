@@ -1798,6 +1798,12 @@ fn standard_psfs(
         full_pdb, min_pdb, &bonds_tsv, &full_psf, &min_psf, &title,
     )?;
     debug!("full.psf {full:?}, minimal.psf {min:?}");
+    if full.unmeasured_bonds > 0 {
+        warn!(
+            "full.psf: {} bonds not measured (an atom position is unknown)",
+            full.unmeasured_bonds
+        );
+    }
 
     // For the submitter, only what says the bonds may be wrong: the topology
     // and the distances disagree, or a bond is implausibly long. Which

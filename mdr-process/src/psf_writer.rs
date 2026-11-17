@@ -43,8 +43,8 @@ pub struct PdbAtom {
     pub resid: String,
     pub segid: String,
     pub element: String,
-    /// None where a coordinate does not parse, such as an overflowed
-    /// `********` field; such an atom's bonds are not measured
+    /// None where a coordinate overflowed its field (`********`); such an
+    /// atom's bonds are not measured
     pub xyz: Option<[f64; 3]>,
 }
 
@@ -54,6 +54,9 @@ pub struct PsfCounts {
     pub num_atoms: usize,
     pub num_bonds: usize,
     pub long_bonds: usize,
+    /// Bonds to an atom whose position is unknown (`********`): neither
+    /// long nor short, so not in `long_bonds`
+    pub unmeasured_bonds: usize,
 }
 
 // --------------------------------------------------
@@ -68,8 +71,10 @@ pub fn write_psfs(
     min_psf: &Path,
     title: &str,
 ) -> Result<(PsfCounts, PsfCounts)> {
-    let full = read_pdb(&fs::read_to_string(full_pdb)?);
-    let min = read_pdb(&fs::read_to_string(min_pdb)?);
+    let full = read_pdb(&fs::read_to_string(full_pdb)?)
+        .map_err(|e| anyhow!("{}: {e}", full_pdb.display()))?;
+    let min = read_pdb(&fs::read_to_string(min_pdb)?)
+        .map_err(|e| anyhow!("{}: {e}", min_pdb.display()))?;
     if full.is_empty() {
         bail!("{} has no atoms", full_pdb.display());
     }
@@ -135,16 +140,19 @@ fn write_checked(
         num_atoms: atoms.len(),
         num_bonds: bonds.len(),
         long_bonds: count_long(atoms, bonds),
+        unmeasured_bonds: count_unmeasured(atoms, bonds),
     })
 }
 
 // --------------------------------------------------
-/// The atoms of a PDB's first model, with each atom's segment
-pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
+/// The atoms of a PDB's first model, with each atom's segment. A coordinate
+/// of all asterisks (an overflowed 8.3f field) is an unknown position; any
+/// other that does not parse is an error, as in `sequence::read_atoms`.
+pub fn read_pdb(text: &str) -> Result<Vec<PdbAtom>> {
     let mut atoms = vec![];
     let mut block = 0usize;
     let mut block_has_atoms = false;
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
         if line.starts_with("ENDMDL") {
             break;
         }
@@ -162,7 +170,15 @@ pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
         }
         let col =
             |a: usize, b: usize| line.get(a..b.min(line.len())).unwrap_or("").trim();
-        let coord = |a: usize, b: usize| col(a, b).parse::<f64>().ok();
+        let coord = |a: usize, b: usize| -> Result<Option<f64>> {
+            let field = col(a, b);
+            if !field.is_empty() && field.chars().all(|c| c == '*') {
+                return Ok(None);
+            }
+            field.parse::<f64>().map(Some).map_err(|e| {
+                anyhow!("line {}: columns {}-{}: {e}: {line:?}", i + 1, a + 1, b)
+            })
+        };
         let name = col(12, 16).to_string();
         let chain = col(21, 22);
         // A blank chain column: its TER block, set below once the whole
@@ -180,7 +196,7 @@ pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
             resname: col(16, 21).to_string(),
             resid: col(22, 27).to_string(),
             segid,
-            xyz: match (coord(30, 38), coord(38, 46), coord(46, 54)) {
+            xyz: match (coord(30, 38)?, coord(38, 46)?, coord(46, 54)?) {
                 (Some(x), Some(y), Some(z)) => Some([x, y, z]),
                 _ => None,
             },
@@ -189,7 +205,7 @@ pub fn read_pdb(text: &str) -> Vec<PdbAtom> {
     }
 
     blank_segments(&mut atoms);
-    atoms
+    Ok(atoms)
 }
 
 // --------------------------------------------------
@@ -419,6 +435,14 @@ fn trunc(s: &str, n: usize) -> &str {
 }
 
 // --------------------------------------------------
+/// Bonds with an end whose position is unknown
+fn count_unmeasured(atoms: &[PdbAtom], bonds: &[(usize, usize)]) -> usize {
+    bonds
+        .iter()
+        .filter(|&&(i, j)| atoms[i].xyz.is_none() || atoms[j].xyz.is_none())
+        .count()
+}
+
 fn count_long(atoms: &[PdbAtom], bonds: &[(usize, usize)]) -> usize {
     bonds
         .iter()
@@ -476,7 +500,7 @@ mod tests {
 
     #[test]
     fn with_no_chain_id_at_all_ter_blocks_are_segments_but_water_is_wat() {
-        let atoms = read_pdb(&blank_chain_pdb());
+        let atoms = read_pdb(&blank_chain_pdb()).unwrap();
         let segs: Vec<&str> = atoms.iter().map(|a| a.segid.as_str()).collect();
         assert_eq!(segs, ["A", "A", "B", "B", "WAT", "WAT"]);
         assert_eq!(atoms[4].resid, "1");
@@ -489,7 +513,7 @@ mod tests {
         let pdb = atom(1, "N", "ALA", 'X', 1, "N", 0.0)
             + "TER\n"
             + &atom(2, "N", "ALA", 'X', 2, "N", 3.0);
-        let atoms = read_pdb(&pdb);
+        let atoms = read_pdb(&pdb).unwrap();
         assert_eq!(atoms[0].segid, "X");
         assert_eq!(atoms[1].segid, "X");
     }
@@ -513,7 +537,7 @@ mod tests {
             pdb += "TER\n";
         }
         pdb += &atom(13, "SOD", "SOD", ' ', 5, "NA", 90.0);
-        let atoms = read_pdb(&pdb);
+        let atoms = read_pdb(&pdb).unwrap();
         let got: Vec<(&str, &str)> = atoms
             .iter()
             .map(|a| (a.segid.as_str(), a.resid.as_str()))
@@ -540,7 +564,7 @@ mod tests {
 
     #[test]
     fn the_psf_reads_back_with_its_atoms_bonds_and_masses() {
-        let atoms = read_pdb(&blank_chain_pdb());
+        let atoms = read_pdb(&blank_chain_pdb()).unwrap();
         let bonds = vec![(0, 1), (2, 3), (4, 5)];
         let text = psf_text(&atoms, &bonds, "bonds from test.psf");
         let back = parse_psf(&text).unwrap();
@@ -568,7 +592,7 @@ mod tests {
 
     #[test]
     fn minimal_atoms_are_found_in_full_in_order() {
-        let full = read_pdb(&blank_chain_pdb());
+        let full = read_pdb(&blank_chain_pdb()).unwrap();
         let min: Vec<PdbAtom> = full[..4].to_vec();
         assert_eq!(find_in_full(&min, &full).unwrap(), [0, 1, 2, 3]);
         let mut wrong = full[..2].to_vec();
@@ -623,7 +647,7 @@ mod tests {
 
     #[test]
     fn long_bonds_are_counted() {
-        let atoms = read_pdb(&blank_chain_pdb());
+        let atoms = read_pdb(&blank_chain_pdb()).unwrap();
         // N(0) to N(10): a 10 A "bond"
         assert_eq!(count_long(&atoms, &[(0, 1), (0, 2)]), 1);
     }
@@ -634,9 +658,59 @@ mod tests {
         // every bond to it counted as long (mdrepo-rs#89)
         let mut overflowed = atom(2, "CA", "ALA", 'A', 2, "C", 0.0);
         overflowed.replace_range(30..38, "********");
-        let atoms = read_pdb(&(atom(1, "CA", "ALA", 'A', 1, "C", 50.0) + &overflowed));
+        let atoms =
+            read_pdb(&(atom(1, "CA", "ALA", 'A', 1, "C", 50.0) + &overflowed)).unwrap();
         assert_eq!(atoms[1].xyz, None);
         assert_eq!(count_long(&atoms, &[(0, 1)]), 0);
+    }
+
+    #[test]
+    fn a_bond_to_an_overflowed_position_is_counted_unmeasured() {
+        let mut overflowed = atom(2, "CA", "ALA", 'A', 2, "C", 0.0);
+        overflowed.replace_range(30..38, "********");
+        let pdb = atom(1, "CA", "ALA", 'A', 1, "C", 50.0)
+            + &overflowed
+            + &atom(3, "CA", "ALA", 'A', 3, "C", 51.0);
+        let atoms = read_pdb(&pdb).unwrap();
+        // 1-2 touches the unknown atom; 1-3 is measured (1 A, not long)
+        assert_eq!(count_unmeasured(&atoms, &[(0, 1), (0, 2), (1, 2)]), 2);
+        assert_eq!(count_long(&atoms, &[(0, 1), (0, 2), (1, 2)]), 0);
+    }
+
+    #[test]
+    fn a_malformed_coordinate_is_an_error() {
+        // Only a whole field of asterisks is an unknown position; anything
+        // else that does not parse fails, as sequence.rs does (it was 0.0)
+        for junk in ["  12.3ab", "  ***.12", "        "] {
+            let mut line = atom(1, "CA", "ALA", 'A', 1, "C", 0.0);
+            line.replace_range(46..54, junk);
+            let err = read_pdb(&line).unwrap_err().to_string();
+            assert!(err.contains("line 1: columns 47-54"), "{junk:?}: {err}");
+        }
+        let cut = atom(1, "CA", "ALA", 'A', 1, "C", 0.0)[..46].to_string();
+        assert!(read_pdb(&cut).is_err());
+    }
+
+    #[test]
+    fn the_line_from_issue_89_reads() {
+        // Verbatim from mdrepo-rs#89 (zenodo:13880099, line 132)
+        let line = "ATOM     66  B     B    66       9.827 740.753********  1.00  \
+                    0.00           B  ";
+        let atoms = read_pdb(line).unwrap();
+        assert_eq!(atoms.len(), 1);
+        // Blank chain column: a HET segment, renumbered from 1
+        assert_eq!(atoms[0].resid, "1");
+        assert_eq!(atoms[0].name, "B");
+        assert_eq!(atoms[0].xyz, None);
+    }
+
+    #[test]
+    fn every_axis_can_overflow() {
+        for axis in 0..3 {
+            let mut line = atom(1, "CA", "ALA", 'A', 1, "C", 0.0);
+            line.replace_range(30 + 8 * axis..38 + 8 * axis, "********");
+            assert_eq!(read_pdb(&line).unwrap()[0].xyz, None, "axis {axis}");
+        }
     }
 
     #[test]

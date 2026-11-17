@@ -24,6 +24,22 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   still an error. The psf writer read one as 0.0 and counted every bond to
   it as long; it now leaves those bonds out of the count. The mmCIF writer
   still reads one as 0.0 and is not changed here.
+- **The psf writer reads coordinates by the same rule as the sequence.**
+  It read any coordinate that did not parse as 0.0 (then, in the first
+  draft of this change, as unknown). Now only a field of asterisks is an
+  unknown position and anything else fails the psf, as sequence extraction
+  does. Bonds to an unknown position are counted (`unmeasured_bonds`) and
+  logged as a warning, not dropped without a word.
+- **A later copy of a backbone atom with a position replaces an earlier
+  one without.** "First one wins" kept an overflowed copy over a readable
+  one (an alternate location or a duplicate atom).
+- **Joins the numbering decided only because a backbone position is
+  unknown are counted and logged as a warning.** With C(i) or N(i+1) and
+  both CAs unknown, nothing can be measured and a real chain break there
+  is missed.
+- Only Fortran-style overflow (`********`) is caught. A C-style writer
+  prints the wider number (`10000.500`), which shifts every later column
+  and is not detected.
 
 ## 0.41.2 (unreleased)
 
