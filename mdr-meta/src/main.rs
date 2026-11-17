@@ -1,6 +1,9 @@
 use anyhow::{Result, bail};
 use clap::Parser;
-use libmdrepo::metadata::{Meta, MetaCheckOptions};
+use libmdrepo::{
+    metadata::{Meta, MetaCheckOptions},
+    spec::Spec,
+};
 use mdr_meta::{
     generate::generate,
     types::{Cli, Command, FileFormat},
@@ -105,6 +108,9 @@ fn run(args: Cli) -> Result<bool> {
             let mut out_file = open_outfile(&args.outfile)?;
             let meta = parse_file(&args.filename)?;
             write!(out_file, "{}", meta.to_toml()?)?;
+        }
+        Some(Command::Spec) => {
+            println!("{}", Spec::current().to_json()?);
         }
         Some(Command::Upgrade) => {
             let status = self_update::backends::github::Update::configure()

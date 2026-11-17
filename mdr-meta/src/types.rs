@@ -30,6 +30,10 @@ pub enum Command {
     /// Print metadata in TOML format
     ToToml(ToTomlArgs),
 
+    /// Print the spec's choices and limits (software and versions, water
+    /// models, solutes, ranges, ...) as JSON
+    Spec,
+
     /// Upgrade binary to the latest release
     Upgrade,
 }

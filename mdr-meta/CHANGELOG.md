@@ -6,6 +6,15 @@ GitHub release note for that version (see `.github/workflows/release.yml`)
 
 ## 0.3.31
 
+### `mdr-meta spec` prints the spec's choices
+
+`mdr-meta spec` prints, as JSON, what the metadata file may contain where
+the spec fixes the choices: each software name with its versions, the water
+models, solute names, additional-file types and ligand sequence types, and
+the numeric ranges (temperature, timestep, frame spacing, water density,
+solute concentration). The website's forms read these instead of keeping
+their own copies.
+
 ### CUSTOM files must be formats processing can read
 
 `software_name = "CUSTOM"` still needs no engine's usual combination of file
