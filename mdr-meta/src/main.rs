@@ -114,7 +114,7 @@ fn run(args: Cli) -> Result<bool> {
         }
         Some(Command::Upgrade) => {
             let status = self_update::backends::github::Update::configure()
-                .repo_owner("TravisWheelerLab")
+                .repo_owner("MD-Repo")
                 .repo_name("mdrepo-rs")
                 .bin_name("mdr-meta")
                 .show_download_progress(true)

@@ -4,6 +4,15 @@ Notable user-facing changes to `mdr-meta`. Each entry here becomes the
 GitHub release note for that version (see `.github/workflows/release.yml`)
 -- write it before tagging, not after.
 
+## 0.3.32
+
+### `mdr-meta upgrade` looks in MD-Repo/mdrepo-rs
+
+The repository moved from TravisWheelerLab to the MD-Repo organization.
+`mdr-meta upgrade` now looks for new releases at
+https://github.com/MD-Repo/mdrepo-rs/releases. Older versions still find
+them, through GitHub's redirect from the old address. Nothing else changes.
+
 ## 0.3.31
 
 ### `mdr-meta spec` prints the spec's choices
