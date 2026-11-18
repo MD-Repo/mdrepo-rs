@@ -117,11 +117,16 @@ def find_release_by_version(releases, version):
 
 # --------------------------------------------------
 def extract_os_arch_from_filename(filename) -> Optional[ReleaseInfo]:
-    pattern = re.compile(r"^(.+)(?:\.tar\.gz|\.zip)$")
+    # Asset names are "<binary>-<arch>-<rest of the target triple>", e.g.
+    # mdr-meta-x86_64-apple-darwin.tar.gz. The binary's own name has a
+    # hyphen, so splitting on the first two hyphens gave arch "meta";
+    # anchor on the architecture instead.
+    pattern = re.compile(
+        r"^.+?-(x86_64|x64|aarch64|arm64|i686|386|arm)-(.+)(?:\.tar\.gz|\.zip)$"
+    )
 
     if match := pattern.search(filename):
-        stem = match.group(1)
-        _, arch, os = stem.split("-", 2)
+        arch, os = match.groups()
 
         if os in ["macos-latest", "apple-darwin", "x86_64-apple-darwin"]:
             os = "MacOS"
@@ -134,9 +139,9 @@ def extract_os_arch_from_filename(filename) -> Optional[ReleaseInfo]:
 
         if arch == "x64" or arch == "x86_64":
             arch = "Intel/AMD 64-bit"
-        elif arch == "386":
+        elif arch in ("386", "i686"):
             arch = "Intel/AMD 32-bit"
-        elif arch == "arm64":
+        elif arch in ("arm64", "aarch64"):
             if os == "MacOS":
                 arch = "M1/M2/M3 (ARM 64-bit)"
             else:
