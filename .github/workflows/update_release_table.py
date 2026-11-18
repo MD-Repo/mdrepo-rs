@@ -8,10 +8,10 @@ import json
 from typing import NamedTuple, Optional, TextIO
 
 # GitHub repository details. Prefer the value Actions provides so this
-# keeps working across a rename -- the hardcoded fallback said
-# "TravisWheelerLab/mdr" long after the repo became "mdrepo-rs", and only
-# worked because the API follows the rename redirect.
-REPO = os.getenv("GITHUB_REPOSITORY", "TravisWheelerLab/mdrepo-rs")
+# keeps working across a rename or transfer; the fallback is only for
+# running it by hand. (The repo moved from TravisWheelerLab to MD-Repo on
+# 2026-11-18.)
+REPO = os.getenv("GITHUB_REPOSITORY", "MD-Repo/mdrepo-rs")
 API_URL = f"https://api.github.com/repos/{REPO}/releases"
 
 # Heading that opens the section this script owns. Everything from here
