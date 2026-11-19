@@ -11,6 +11,31 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   database or iRODS, or in its command line;
 - **patch** (0.2.0 -> 0.2.1) for everything else.
 
+## 0.43.0 (unreleased)
+
+- **`ticket` runs at most `--num-threads` landings at once, and a landing
+  holds no database connection while it processes** (mdrepo-rs#130). On
+  2026-11-19 all five prod jobs for five 200-landing tickets failed on
+  "remaining connection slots are reserved": one `mdr-process` held 79
+  connections, one per landing in flight, with `--num-threads 4`.
+  - Why so many landings: they ran by rayon `into_par_iter` on the global
+    pool, and `reference::in_pool` runs UniProt fetches on a second pool
+    with `install`. A global-pool worker waiting on another pool runs other
+    jobs from its own, including whole new landings. Reproduced in
+    `bounded::tests::rayon_par_iter_runs_more_landings_than_threads`
+    (ignored; 16 landings at once on 2 threads).
+  - New `bounded::map_bounded`: the landings run on `--num-threads` OS
+    threads (rayon's global pool size), results in order; inside a landing,
+    `process` still uses the global pool. A panic keeps its own message.
+  - The feedback connection is closed after "Processing started" and a new
+    one is opened for the result, instead of one held through fetch,
+    conversion, BLAST and push.
+  - Feedback connections (setup, start, result, ticket complete) are tried
+    3 times, 2 s then 4 s apart, so a full Postgres for a moment no longer
+    loses a landing's upload instance.
+  - Throughput: landings that used to overlap by accident now wait their
+    turn. If a large ticket runs slower, raise `--num-threads`.
+
 ## 0.42.1 (unreleased)
 
 - **The `solvent` check's share warning needs something to strip in
