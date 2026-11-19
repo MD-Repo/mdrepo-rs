@@ -1,4 +1,5 @@
 use crate::{
+    bounded::map_bounded,
     process,
     types::{ProcessArgs, Server, SubmissionCompleteJson, TicketArgs, TicketInfo},
 };
@@ -16,7 +17,6 @@ use mdr_db::{
     models::{NewUploadInstance, NewUploadMessage, TicketUpdate, UploadInstanceUpdate},
     ops,
 };
-use rayon::prelude::*;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -165,16 +165,21 @@ pub fn process(args: &TicketArgs) -> Result<()> {
         feedback.as_ref()
     };
 
-    // Process every landing subdirectory in parallel. Each task opens its own
-    // DB connection (a Diesel PgConnection can't be shared across threads), so
-    // parallelism is unchanged; we collect each landing's outcome -- `Ok(())`
-    // for success or `Err(reason)` describing the directory and its failure --
-    // so we can both decide whether the ticket is complete and report exactly
-    // which landings failed and why.
+    // Process the landing subdirectories, at most --num-threads at once (the
+    // size of rayon's global pool, which main.rs sets from it). Not by
+    // rayon's par_iter: a worker waiting inside a landing (on another pool,
+    // as reference.rs's UniProt fetches do) takes more landings from the
+    // global queue, and 79 ran at once with --num-threads 4, each holding a
+    // DB connection (mdrepo-rs#130). Inside a landing, process's own
+    // parallel loops still use the global pool. We collect each landing's
+    // outcome -- `Ok(())` for success or `Err(reason)` describing the
+    // directory and its failure -- so we can both decide whether the ticket
+    // is complete and report exactly which landings failed and why.
     let start = Instant::now();
-    let results: Vec<std::result::Result<(), String>> = ticket_dirs
-        .into_par_iter()
-        .map(|ticket_dir| {
+    let landings_at_once = rayon::current_num_threads();
+    debug!("Processing up to {landings_at_once} landings at once");
+    let results: Vec<std::result::Result<(), String>> =
+        map_bounded(ticket_dirs, landings_at_once, |ticket_dir| {
             process_landing(
                 &ticket_dir,
                 args,
@@ -183,8 +188,7 @@ pub fn process(args: &TicketArgs) -> Result<()> {
                 writes,
                 fetch_elapsed,
             )
-        })
-        .collect();
+        });
 
     // Only flip processing_complete when every landing succeeded.
     let failures: Vec<&String> =
@@ -355,8 +359,9 @@ pub fn check_manifest(dir: &Path) -> Result<Vec<String>> {
 
 // --------------------------------------------------
 /// DB context shared (read-only) across the parallel per-landing tasks. Each
-/// task opens its own `PgConnection` from `db_url` because a Diesel
-/// `PgConnection` cannot be shared across threads.
+/// task opens its own `PgConnection` from `db_url` (a Diesel `PgConnection`
+/// cannot be shared across threads), and only while it writes: once to
+/// record the start, once to record the result, never across processing.
 struct FeedbackCtx {
     db_url: String,
     ticket_id: i64,
@@ -385,7 +390,7 @@ fn build_feedback_ctx(server: &Server, ticket_id: i64) -> Option<FeedbackCtx> {
             return None;
         }
     };
-    let mut conn = match mdr_db::connect(&url) {
+    let mut conn = match connect_with_retry(&url, CONNECT_TRIES, CONNECT_WAIT) {
         Ok(conn) => conn,
         Err(e) => {
             info!("DB feedback disabled (connect: {e})");
@@ -426,10 +431,12 @@ fn process_landing(
         .unwrap_or_default();
 
     // Open a per-task connection and ensure the upload instance exists *before*
-    // processing, so a failure can still be recorded against it.
-    let mut db: Option<(PgConnection, i64)> = None;
+    // processing, so a failure can still be recorded against it. The
+    // connection is closed before processing (a landing can take hours) and
+    // a new one is opened for the result below (mdrepo-rs#130).
+    let mut upload_id: Option<i64> = None;
     if let Some(ctx) = feedback {
-        match mdr_db::connect(&ctx.db_url) {
+        match connect_with_retry(&ctx.db_url, CONNECT_TRIES, CONNECT_WAIT) {
             Ok(mut conn) => {
                 let filenames = collect_filenames(ticket_dir).join(", ");
                 match ensure_upload_instance(
@@ -440,7 +447,7 @@ fn process_landing(
                     &ctx.orcid,
                     &filenames,
                 ) {
-                    Ok((upload_id, skip)) => {
+                    Ok((id, skip)) => {
                         // Nothing has been done to this landing yet, so this
                         // is the cheapest possible place to notice there is
                         // nothing to do. Skipping keeps the landing counted as
@@ -450,7 +457,7 @@ fn process_landing(
                             Some(Skip::Done) => {
                                 log_message(
                                     &mut conn,
-                                    upload_id,
+                                    id,
                                     "Skipped: already processed successfully \
                                      (--force to reprocess)",
                                     false,
@@ -462,7 +469,7 @@ fn process_landing(
                             Some(Skip::Abandoned) => {
                                 log_message(
                                     &mut conn,
-                                    upload_id,
+                                    id,
                                     "Skipped: landing is marked abandoned \
                                      (--force to reprocess)",
                                     false,
@@ -474,26 +481,20 @@ fn process_landing(
                             None => {}
                         }
 
-                        log_message(
-                            &mut conn,
-                            upload_id,
-                            "Processing started",
-                            false,
-                            false,
-                        );
+                        log_message(&mut conn, id, "Processing started", false, false);
                         // Shared across every landing in this ticket (the
                         // fetch downloads the whole ticket in one shot), so
                         // this is the same duration on each instance's log.
                         if let Some(elapsed) = fetch_elapsed {
                             log_message(
                                 &mut conn,
-                                upload_id,
+                                id,
                                 &format!("Fetched uploads in {elapsed:?}"),
                                 false,
                                 false,
                             );
                         }
-                        db = Some((conn, upload_id));
+                        upload_id = Some(id);
                     }
                     Err(e) => info!(
                         "Failed to record upload instance for landing \
@@ -536,6 +537,25 @@ fn process_landing(
             transfer_threads: args.transfer_threads,
             ticket_id: Some(args.ticket_id as i64),
         }),
+    };
+
+    // A fresh connection to record the result: the start's was closed before
+    // processing. If it cannot be had, the landing's outcome still stands;
+    // only its feedback rows are missing, as when the start's failed.
+    let mut db: Option<(PgConnection, i64)> = match (feedback, upload_id) {
+        (Some(ctx), Some(id)) => {
+            match connect_with_retry(&ctx.db_url, CONNECT_TRIES, CONNECT_WAIT) {
+                Ok(conn) => Some((conn, id)),
+                Err(e) => {
+                    info!(
+                        "Failed to connect to record the result for landing \
+                         '{landing_id}': {e}"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
     };
 
     let outcome = match &outcome {
@@ -623,6 +643,47 @@ fn process_landing(
         ticket_start.elapsed()
     );
     outcome
+}
+
+// --------------------------------------------------
+/// Tries for each feedback connection, and the wait before the first retry
+/// (doubled each time after). Postgres refusing a connection when its slots
+/// are full is the case this is for (2026-11-19, mdrepo-rs#130).
+const CONNECT_TRIES: u32 = 3;
+const CONNECT_WAIT: Duration = Duration::from_secs(2);
+
+/// [`mdr_db::connect`], tried up to `tries` times, `wait` then twice that
+/// between them
+fn connect_with_retry(
+    url: &str,
+    tries: u32,
+    wait: Duration,
+) -> std::result::Result<PgConnection, diesel::ConnectionError> {
+    retry(tries, wait, std::thread::sleep, || mdr_db::connect(url))
+}
+
+/// `f` until it succeeds or has been tried `tries` times (at least once),
+/// calling `sleep` with `wait`, doubled each time, between tries; the last
+/// error if none succeeded
+fn retry<T, E>(
+    tries: u32,
+    wait: Duration,
+    mut sleep: impl FnMut(Duration),
+    mut f: impl FnMut() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let mut wait = wait;
+    let mut tried = 1;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if tried >= tries => return Err(e),
+            Err(_) => {
+                sleep(wait);
+                wait *= 2;
+                tried += 1;
+            }
+        }
+    }
 }
 
 // --------------------------------------------------
@@ -766,7 +827,7 @@ fn update_instance_result(
 // --------------------------------------------------
 /// Set `md_ticket.processing_complete = true`.
 fn mark_ticket_complete(ctx: &FeedbackCtx) {
-    let mut conn = match mdr_db::connect(&ctx.db_url) {
+    let mut conn = match connect_with_retry(&ctx.db_url, CONNECT_TRIES, CONNECT_WAIT) {
         Ok(conn) => conn,
         Err(e) => {
             info!("Failed to connect to mark ticket complete: {e}");
@@ -819,6 +880,82 @@ mod tests {
             r#"{{"total_filenum":1,"total_filesize":10,"status":"completed","files":[{{"irods_path":"sim.xtc","size":10,"md5_hash":"{md5}"}}]}}"#
         );
         fs::write(dir.join(COMPLETED_JSON), json).unwrap();
+    }
+
+    #[test]
+    fn retry_first_success_does_not_sleep() {
+        let mut slept = vec![];
+        let r: std::result::Result<i32, &str> =
+            retry(3, Duration::from_secs(2), |d| slept.push(d), || Ok(7));
+        assert_eq!(r, Ok(7));
+        assert!(slept.is_empty());
+    }
+
+    #[test]
+    fn retry_waits_doubling_until_success() {
+        let (mut slept, mut calls) = (vec![], 0);
+        let r: std::result::Result<i32, String> = retry(
+            3,
+            Duration::from_secs(2),
+            |d| slept.push(d),
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(format!("no {calls}"))
+                } else {
+                    Ok(calls)
+                }
+            },
+        );
+        assert_eq!(r, Ok(3));
+        assert_eq!(slept, vec![Duration::from_secs(2), Duration::from_secs(4)]);
+    }
+
+    #[test]
+    fn retry_gives_the_last_error_after_all_tries() {
+        let (mut slept, mut calls) = (0, 0);
+        let r: std::result::Result<(), String> = retry(
+            4,
+            Duration::from_millis(1),
+            |_| slept += 1,
+            || {
+                calls += 1;
+                Err(format!("no {calls}"))
+            },
+        );
+        assert_eq!(r, Err("no 4".to_string()));
+        assert_eq!((calls, slept), (4, 3));
+    }
+
+    #[test]
+    fn retry_zero_or_one_tries_once_without_sleeping() {
+        for tries in [0, 1] {
+            let (mut slept, mut calls) = (0, 0);
+            let r: std::result::Result<(), &str> = retry(
+                tries,
+                Duration::from_secs(1),
+                |_| slept += 1,
+                || {
+                    calls += 1;
+                    Err("no")
+                },
+            );
+            assert!(r.is_err());
+            assert_eq!((calls, slept), (1, 0), "tries {tries}");
+        }
+    }
+
+    #[test]
+    fn connect_with_retry_reports_a_refused_connection() {
+        // nothing listens on port 1: refused at once, tried twice
+        let start = std::time::Instant::now();
+        let r = connect_with_retry(
+            "postgres://nobody@127.0.0.1:1/none",
+            2,
+            Duration::from_millis(10),
+        );
+        assert!(r.is_err());
+        assert!(start.elapsed() >= Duration::from_millis(10));
     }
 
     #[test]
