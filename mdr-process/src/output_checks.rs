@@ -9,7 +9,7 @@
 //! an old-vs-new byte comparison could not tell that from noise. Found
 //! 2026-11-09 on MDR00105222 (simulation-processing #44).
 //!
-//! Four checks, each returning [`Finding`]s:
+//! Five checks, each returning [`Finding`]s:
 //!
 //! - **box**: every frame's box is finite and either zero in every frame or
 //!   a real cell in every frame (three vectors 0.1-10,000 nm enclosing a
@@ -37,6 +37,12 @@
 //!   stripped ions and lipids, as many of each (fail): a ligand stripped
 //!   from minimal (MISATO's MOL, 2025-10-14..2026-04-29) passed every other
 //!   check, since those compare files within the full or minimal set.
+//! - **solvent**: the other way round, minimal keeps none of what it is
+//!   meant to strip: no residue named as water, a stripped ion or a lipid,
+//!   and no three-atom residue of one O and two H (fail); a minimal holding
+//!   more than half of full's atoms warns. Desmond's water `T3P`, missing
+//!   from the strip list, left all of Zenodo 4501408's water in minimal.
+//!   minimal_lipid.* is not read.
 //!
 //! Read-only. A missing file is skipped, so the same checks run on a fresh
 //! `process` output (no .psf/.mmcif yet), on an MDR-108 build (orig/ + new/,
@@ -1111,28 +1117,59 @@ pub fn check_atoms(files: &HashMap<String, PathBuf>, trajs: &[Frames]) -> Vec<Fi
 }
 
 // --- check 4: solute ---------------------------------------------------------------
-/// Residue names `minimal.*` drops on purpose, compared without case: water,
-/// the stripped ions and the lipids (simulation-processing
-/// `cpptraj_gmx_traj_manipulation.py` KNOWN_WATER, KNOWN_IONS, KNOWN_LIPIDS;
-/// the GROMACS path also drops what `residuetypes.dat` calls Water, and
-/// [`crate::sequence::WATER`] names the rest). Every other residue -- a
-/// ligand, a cofactor, a bound Zn2+ or Ca2+ -- belongs in minimal.
-const MINIMAL_DROPS: &[&str] = &[
-    // water
+/// Water names `minimal.*` drops, compared without case (simulation-processing
+/// `cpptraj_gmx_traj_manipulation.py` KNOWN_WATER; the GROMACS path also
+/// drops what `residuetypes.dat` calls Water, which adds OHH and T3H; and
+/// [`crate::sequence::WATER`] names the rest). With [`MINIMAL_IONS`] and
+/// [`MINIMAL_LIPIDS`] this is everything minimal drops on purpose; every
+/// other residue -- a ligand, a cofactor, a bound Zn2+ or Ca2+ -- belongs in
+/// minimal.
+const MINIMAL_WATER: &[&str] = &[
     "WAT", "HOH", "TIP3", "TIP3P", "TIP4", "TIP4P", "TIP5", "OPC", "SPC", "SOL", "OHH",
-    "T3H", // ions
-    "NA", "CL", "K", "SOD", "CLA", "NA+", "CL-", "K+", "MG2+", "MG",
-    // lipids
+    "T3H",
+];
+
+/// The ions simulation-processing strips from minimal, spelled exactly as
+/// its KNOWN_IONS spells them. Its cpptraj masks and `gmx make_ndx` `r`
+/// selections match residue names with their case, so `Mg2+` is stripped
+/// and `MG2+` is kept, like any ion the list does not name (a bound Zn2+ or
+/// Ca2+).
+const MINIMAL_IONS: &[&str] = &[
+    "NA", "CL", "K", "SOD", "CLA", "NA+", "CL-", "K+", "Mg2+", "MG", "Na+", "Cl-",
+];
+
+/// The lipids simulation-processing strips from minimal (KNOWN_LIPIDS),
+/// matched with case like [`MINIMAL_IONS`]
+const MINIMAL_LIPIDS: &[&str] = &[
     "DPPC", "POPC", "POPE", "DOPC", "DLPC", "DMPC", "DSPC", "CHOL",
 ];
 
-/// True for a residue name minimal is meant to drop
-pub fn dropped_from_minimal(resname: &str) -> bool {
-    let r = resname.trim();
-    MINIMAL_DROPS
+fn water_name(r: &str) -> bool {
+    MINIMAL_WATER
         .iter()
         .chain(crate::sequence::WATER)
         .any(|d| d.eq_ignore_ascii_case(r))
+}
+
+/// True for a residue name minimal MAY drop, compared without case. The
+/// lenient reading, for [`check_solute`]: minimal losing one of these is
+/// never a fault.
+pub fn dropped_from_minimal(resname: &str) -> bool {
+    let r = resname.trim();
+    water_name(r)
+        || MINIMAL_IONS
+            .iter()
+            .chain(MINIMAL_LIPIDS)
+            .any(|d| d.eq_ignore_ascii_case(r))
+}
+
+/// True for a residue name minimal MUST NOT keep, for [`check_solvent`]:
+/// water under any case (water left in minimal is always a fault), and the
+/// ions and lipids simulation-processing strips, with their exact case. An
+/// ion or lipid it keeps (`MG2+`, a lower-case `popc`) is not a failure.
+pub fn stripped_from_minimal(resname: &str) -> bool {
+    let r = resname.trim();
+    water_name(r) || MINIMAL_IONS.iter().chain(MINIMAL_LIPIDS).any(|d| *d == r)
 }
 
 /// {residue name: residues of that name}, residues split as
@@ -1192,10 +1229,10 @@ pub fn check_solute(full: &Structure, minimal: &Structure) -> Vec<Finding> {
     }
 }
 
-/// [`check_solute`] on the first full/minimal pair found, .pdb, then
-/// .mmcif, then .psf; nothing when there is no pair or one cannot be read
-/// (the atom check reports that)
-pub fn check_solute_files(files: &HashMap<String, PathBuf>) -> Vec<Finding> {
+/// The first full/minimal pair found, .pdb, then .mmcif, then .psf; None
+/// when there is no pair or one cannot be read (the atom check reports
+/// that)
+fn read_pair(files: &HashMap<String, PathBuf>) -> Option<(Structure, Structure)> {
     let readers: [(&str, fn(&Path) -> Result<Structure>); 3] =
         [("pdb", read_pdb), ("mmcif", read_mmcif), ("psf", read_psf)];
     for (ext, reader) in readers {
@@ -1206,11 +1243,160 @@ pub fn check_solute_files(files: &HashMap<String, PathBuf>) -> Vec<Finding> {
             continue;
         };
         return match (reader(f), reader(m)) {
-            (Ok(full), Ok(minimal)) => check_solute(&full, &minimal),
-            _ => vec![],
+            (Ok(full), Ok(minimal)) => Some((full, minimal)),
+            _ => None,
         };
     }
-    vec![]
+    None
+}
+
+/// [`check_solute`] on the pair [`read_pair`] finds; nothing without one
+pub fn check_solute_files(files: &HashMap<String, PathBuf>) -> Vec<Finding> {
+    read_pair(files).map_or(vec![], |(full, minimal)| check_solute(&full, &minimal))
+}
+
+// --- check 5: solvent -------------------------------------------------------------
+/// A minimal holding more than this share of full's atoms is reported (a
+/// warning). In an explicit-solvent run the water alone is most of the
+/// atoms: MDR00004692's minimal kept 190,491 of 221,089 (86%) with its
+/// water left in. An implicit-solvent or vacuum run has nothing to strip
+/// and keeps all of them, so this cannot fail.
+pub const MINIMAL_SHARE_WARN: f64 = 0.5;
+
+/// Each residue's atoms, residues split as [`residue_starts`] splits them
+fn residues(atoms: &[Atom]) -> Vec<&[Atom]> {
+    let starts = residue_starts(atoms);
+    let ends = starts.iter().skip(1).map(|s| s - 1).chain([atoms.len()]);
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(s, e)| &atoms[s - 1..e])
+        .collect()
+}
+
+/// Three atoms, one O and two H (or D) by element: water, whatever its
+/// residue is called. False when the file gives no elements (.psf).
+fn water_shaped(residue: &[Atom]) -> bool {
+    if residue.len() != 3 {
+        return false;
+    }
+    let (mut o, mut h) = (0, 0);
+    for a in residue {
+        match a.element.trim().to_ascii_uppercase().as_str() {
+            "O" => o += 1,
+            "H" | "D" => h += 1,
+            _ => {}
+        }
+    }
+    o == 1 && h == 2
+}
+
+/// "NAME (n), NAME (n)"
+fn name_counts(counts: &std::collections::BTreeMap<String, usize>) -> String {
+    counts
+        .iter()
+        .map(|(name, n)| format!("{name} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Minimal holds none of what it is meant to strip: [`check_solute`]
+/// turned around. Found 2026-11-17: Zenodo 4501408's 20 staging deposits
+/// kept all their water in minimal (MDR00004692: 190,491 of 221,089
+/// atoms), because Desmond names TIP3P `T3P` and simulation-processing's
+/// KNOWN_WATER did not have it (simulation-processing#59, fixed in #60).
+/// Nothing caught it until the viewer showed the protein buried in solvent.
+///
+/// - FAIL: a residue [`stripped_from_minimal`] names: water under any
+///   case, or an ion or lipid simulation-processing strips, with its exact
+///   case (it keeps `MG2+` and strips `Mg2+`). Those lists are kept apart
+///   from simulation-processing's; the ignored test
+///   `strip_lists_match_simulation_processing` compares them.
+/// - FAIL: a residue of one O and two H, water under a name neither list
+///   has (needs elements, so not from a .psf pair).
+/// - WARN, when neither failed: minimal keeps more than
+///   [`MINIMAL_SHARE_WARN`] of full's atoms, which is how solvent or
+///   lipids under a name no list has would show; or an implicit-solvent
+///   or vacuum run, which is why it only warns.
+///
+/// minimal_lipid.* keeps lipids on purpose and is not read here.
+pub fn check_solvent(full: &Structure, minimal: &Structure) -> Vec<Finding> {
+    let (mut listed, mut shaped) = (
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
+    );
+    for res in residues(&minimal.atoms) {
+        let name = res[0].resname.clone();
+        if stripped_from_minimal(&name) {
+            *listed.entry(name).or_insert(0) += 1;
+        } else if water_shaped(res) {
+            *shaped.entry(name).or_insert(0) += 1;
+        }
+    }
+    let mut out = vec![];
+    if !listed.is_empty() {
+        out.push(finding(
+            "solvent",
+            Level::Fail,
+            &minimal.name,
+            format!(
+                "keeps residues minimal is meant to strip (water, a stripped \
+                ion or a lipid): {}",
+                name_counts(&listed)
+            ),
+        ));
+    }
+    if !shaped.is_empty() {
+        out.push(finding(
+            "solvent",
+            Level::Fail,
+            &minimal.name,
+            format!(
+                "keeps residues of one O and two H, water under a name the \
+                strip lists do not have: {}",
+                name_counts(&shaped)
+            ),
+        ));
+    }
+    let (n_min, n_full) = (minimal.atoms.len(), full.atoms.len());
+    let share = if n_full == 0 {
+        0.0
+    } else {
+        n_min as f64 / n_full as f64
+    };
+    if out.is_empty() && share > MINIMAL_SHARE_WARN {
+        out.push(finding(
+            "solvent",
+            Level::Warn,
+            &minimal.name,
+            format!(
+                "keeps {n_min} of the {n_full} atoms of {} ({:.0}%): expected \
+                of an implicit-solvent or vacuum run, which has nothing to \
+                strip; otherwise solvent or lipids under names the strip lists \
+                do not have",
+                full.name,
+                100.0 * share
+            ),
+        ));
+    }
+    if out.is_empty() {
+        out.push(finding(
+            "solvent",
+            Level::Info,
+            &minimal.name,
+            format!(
+                "keeps no water, stripped ion or lipid ({n_min} of the \
+                {n_full} atoms of {})",
+                full.name
+            ),
+        ));
+    }
+    out
+}
+
+/// [`check_solvent`] on the pair [`read_pair`] finds; nothing without one
+pub fn check_solvent_files(files: &HashMap<String, PathBuf>) -> Vec<Finding> {
+    read_pair(files).map_or(vec![], |(full, minimal)| check_solvent(&full, &minimal))
 }
 
 // --------------------------------------------------
@@ -1229,7 +1415,7 @@ pub fn find_files(dir: &Path) -> HashMap<String, PathBuf> {
         .collect()
 }
 
-/// All three checks over the files found in `dir` (one replicate's folder).
+/// Every check over the files found in `dir` (one replicate's folder).
 /// A missing folder is an error; a folder holding none of the files is a
 /// failure, not a pass with nothing to compare.
 pub fn run_checks(
@@ -1283,7 +1469,10 @@ pub fn run_checks(
     }
     out.extend(check_time(&trajs, source.as_deref(), &source_name));
     out.extend(check_atoms(&files, &trajs));
-    out.extend(check_solute_files(&files));
+    if let Some((full, minimal)) = read_pair(&files) {
+        out.extend(check_solute(&full, &minimal));
+        out.extend(check_solvent(&full, &minimal));
+    }
     Ok(out)
 }
 
@@ -1474,6 +1663,13 @@ mod tests {
         (Level::Fail, file.into())
     }
 
+    /// What a whole run over [`full_set`] reports besides infos: full is
+    /// five protein atoms and one water, so minimal keeps 5 of its 6 atoms,
+    /// and the solvent check warns as it should for a solvated system
+    fn toy_set_warns() -> Vec<(Level, String)> {
+        vec![(Level::Warn, "minimal.pdb".into())]
+    }
+
     // --- box geometry ------------------------------------------------------
     #[test]
     fn read_pdb_names_a_bad_coordinate() -> Result<()> {
@@ -1644,7 +1840,7 @@ mod tests {
                 &run(&full_set(&d.path().join("s"), CUBE, C50), Some(true)),
                 None
             ),
-            vec![]
+            toy_set_warns()
         );
     }
 
@@ -1656,7 +1852,7 @@ mod tests {
                 &run(&full_set(&d.path().join("s"), ZERO_BOX, None), Some(false)),
                 None
             ),
-            vec![]
+            toy_set_warns()
         );
     }
 
@@ -2034,7 +2230,7 @@ mod tests {
         let s = full_set(&d.path().join("s"), CUBE, C50);
         fs::write(s.join("full.gro"), "garbage\n 1\n").unwrap();
         assert!(!find_files(&s).contains_key("full.gro"));
-        assert_eq!(levels(&run(&s, None), None), vec![]);
+        assert_eq!(levels(&run(&s, None), None), toy_set_warns());
     }
 
     #[test]
@@ -2046,7 +2242,7 @@ mod tests {
         let bad = full_set(&d.path().join("rep_2"), CUBE, C50);
         write_pdb(&bad.join("minimal.pdb"), &ATOMS[..4], &XYZ[..4], None, 1);
         assert!(find_files(&good).values().all(|p| p.starts_with(&good)));
-        assert_eq!(levels(&run(&good, None), None), vec![]);
+        assert_eq!(levels(&run(&good, None), None), toy_set_warns());
         assert!(levels(&run(&bad, None), Some("atoms")).contains(&fail("minimal")));
     }
 
@@ -2643,6 +2839,407 @@ mod tests {
             .split(':')
         {
             let f = check_solute_files(&find_files(Path::new(d)));
+            assert!(!f.is_empty() && fails(&f).is_empty(), "{d}: {f:?}");
+        }
+    }
+
+    // --- solvent --------------------------------------------------------------
+
+    /// A structure from (atom, residue, resid, element) quadruples
+    fn ste(name: &str, atoms: &[A]) -> Structure {
+        let mut s = st(
+            name,
+            &atoms.iter().map(|a| (a.0, a.1, a.2)).collect::<Vec<_>>(),
+        );
+        for (atom, a) in s.atoms.iter_mut().zip(atoms) {
+            atom.element = a.3.to_string();
+        }
+        s
+    }
+
+    const PROTEIN: [A; 4] = [
+        ("N", "ALA", 1, "N"),
+        ("CA", "ALA", 1, "C"),
+        ("N", "GLY", 2, "N"),
+        ("CA", "GLY", 2, "C"),
+    ];
+
+    /// `n` three-site waters named `name`, numbered from 10
+    fn waters(name: &'static str, n: i64) -> Vec<A> {
+        (0..n)
+            .flat_map(|i| {
+                [
+                    ("O", name, 10 + i, "O"),
+                    ("H1", name, 10 + i, "H"),
+                    ("H2", name, 10 + i, "H"),
+                ]
+            })
+            .collect()
+    }
+
+    fn with(extra: &[A]) -> Vec<A> {
+        let mut v = PROTEIN.to_vec();
+        v.extend_from_slice(extra);
+        v
+    }
+
+    fn solvent_levels(f: &[Finding]) -> Vec<Level> {
+        f.iter().map(|x| x.level).collect()
+    }
+
+    #[test]
+    fn solvent_stripped_minimal_is_info() {
+        let full = ste("full.pdb", &with(&waters("SOL", 4)));
+        let min = ste("minimal.pdb", &PROTEIN);
+        let f = check_solvent(&full, &min);
+        assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
+        assert!(f[0].message.contains("4 of the 16 atoms"), "{f:?}");
+    }
+
+    #[test]
+    fn solvent_desmond_water_left_in_minimal_fails() {
+        // Zenodo 4501408's shape: T3P kept, minimal the whole system
+        let all = with(&waters("T3P", 5));
+        let f = check_solvent(&ste("full.pdb", &all), &ste("minimal.pdb", &all));
+        // one failure, and no share warning on top of it
+        assert_eq!(solvent_levels(&f), vec![Level::Fail], "{f:?}");
+        assert_eq!((f[0].check, f[0].file.as_str()), ("solvent", "minimal.pdb"));
+        assert!(f[0].message.contains("T3P (5)"), "{f:?}");
+        assert!(!f[0].message.contains("ALA"), "{f:?}");
+    }
+
+    #[test]
+    fn solvent_every_dropped_name_fails() {
+        for name in MINIMAL_WATER
+            .iter()
+            .chain(MINIMAL_IONS)
+            .chain(MINIMAL_LIPIDS)
+            .chain(crate::sequence::WATER)
+        {
+            let min = ste("minimal.pdb", &with(&[("X", name, 9, "")]));
+            let f = check_solvent(&ste("full.pdb", &with(&waters("SOL", 9))), &min);
+            assert!(
+                fails(&f)
+                    .iter()
+                    .any(|x| x.message.contains(&format!("{name} (1)"))),
+                "{name}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn solvent_kept_ions_and_ligands_pass() {
+        // a bound Zn2+, Ca2+ and a ligand belong in minimal
+        let keep = [
+            ("ZN", "ZN", 5, "Zn"),
+            ("CA", "CA", 6, "Ca"),
+            ("C1", "MOL", 7, "C"),
+            ("O1", "MOL", 7, "O"),
+        ];
+        let full = ste("full.pdb", &with(&[&keep[..], &waters("WAT", 9)].concat()));
+        let f = check_solvent(&full, &ste("minimal.pdb", &with(&keep)));
+        assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
+    }
+
+    /// The solvent findings for a minimal of the protein plus one atom of
+    /// residue `name` (no element, so only the name can fail it), against a
+    /// full system with water so the share never warns
+    fn solvent_one_residue(name: &'static str) -> Vec<Finding> {
+        let min = ste("minimal.pdb", &with(&[("X", name, 9, "")]));
+        check_solvent(&ste("full.pdb", &with(&waters("SOL", 9))), &min)
+    }
+
+    #[test]
+    fn solvent_ions_match_with_case_like_simulation_processing() {
+        // stripped by simulation-processing, so a failure when kept
+        for name in [
+            "Mg2+", "MG", "NA", "Na+", "NA+", "CL", "Cl-", "CL-", "K", "K+",
+        ] {
+            let f = solvent_one_residue(name);
+            assert_eq!(fails(&f).len(), 1, "{name}: {f:?}");
+            assert!(f[0].message.contains(&format!("{name} (1)")), "{f:?}");
+        }
+        // kept by simulation-processing (cpptraj and make_ndx match case)
+        for name in ["MG2+", "mg", "na+", "Na", "ZN", "Ca2+"] {
+            let f = solvent_one_residue(name);
+            assert!(fails(&f).is_empty(), "{name}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn solvent_lipids_match_with_case() {
+        assert_eq!(fails(&solvent_one_residue("POPC")).len(), 1);
+        assert_eq!(fails(&solvent_one_residue("CHOL")).len(), 1);
+        assert!(fails(&solvent_one_residue("popc")).is_empty());
+        assert!(fails(&solvent_one_residue("Chol")).is_empty());
+    }
+
+    #[test]
+    fn solvent_water_names_fail_in_any_case() {
+        // water left in minimal is a fault whatever its case or path; OHH and
+        // T3H only the GROMACS path strips, and they still fail elsewhere
+        for name in [
+            "sol", "Wat", "hoh", "T3P", "t3p", "OHH", "T3H", "tip3p", "SPCE",
+        ] {
+            let f = solvent_one_residue(name);
+            assert_eq!(fails(&f).len(), 1, "{name}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn solute_still_lets_minimal_drop_any_case() {
+        // the lenient reading is unchanged: minimal dropping these is fine
+        for name in ["MG2+", "Mg2+", "mg2+", "popc", "na+", "Cl-", "sol", " OHH "] {
+            assert!(dropped_from_minimal(name), "{name}");
+        }
+        for name in ["MG2+", "popc", "na+", "ZN", "MOL"] {
+            assert!(!stripped_from_minimal(name), "{name}");
+        }
+        assert!(!dropped_from_minimal("ZN") && !dropped_from_minimal("MOL"));
+    }
+
+    #[test]
+    fn solvent_stripped_names_are_a_subset_of_dropped() {
+        for name in MINIMAL_WATER
+            .iter()
+            .chain(MINIMAL_IONS)
+            .chain(MINIMAL_LIPIDS)
+            .chain(crate::sequence::WATER)
+        {
+            assert!(stripped_from_minimal(name), "{name}");
+            assert!(dropped_from_minimal(name), "{name}");
+        }
+    }
+
+    /// The quoted names in a Python list `NAME = [ ... ]` in `text`
+    fn python_list(text: &str, name: &str) -> Vec<String> {
+        let start = text
+            .find(&format!("\n{name} = ["))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let body = &text[start..];
+        let body = &body[body.find('[').unwrap() + 1..body.find(']').unwrap()];
+        body.lines()
+            .map(|l| l.split('#').next().unwrap())
+            .flat_map(|l| l.split(','))
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs a simulation-processing checkout: MDR_SIMPROC_DIR"]
+    fn strip_lists_match_simulation_processing() {
+        let dir = std::env::var("MDR_SIMPROC_DIR").expect("MDR_SIMPROC_DIR");
+        let path = Path::new(&dir).join("python/cpptraj_gmx_traj_manipulation.py");
+        let text = fs::read_to_string(&path).expect("read the strip lists");
+        let sorted = |v: Vec<String>| {
+            let mut v = v;
+            v.sort();
+            v
+        };
+        let ours = |l: &[&str]| sorted(l.iter().map(|s| s.to_string()).collect());
+        assert_eq!(sorted(python_list(&text, "KNOWN_IONS")), ours(MINIMAL_IONS));
+        assert_eq!(
+            sorted(python_list(&text, "KNOWN_LIPIDS")),
+            ours(MINIMAL_LIPIDS)
+        );
+        for name in python_list(&text, "KNOWN_WATER") {
+            assert!(water_name(&name), "KNOWN_WATER {name} is not water here");
+        }
+    }
+
+    #[test]
+    fn python_list_reads_names_and_skips_comments() {
+        let text =
+            "x\nKNOWN_IONS = [\n    \"NA\",\n    \"Mg2+\",  # Amber\n    \"Cl-\",\n]\n";
+        assert_eq!(python_list(text, "KNOWN_IONS"), vec!["NA", "Mg2+", "Cl-"]);
+    }
+
+    #[test]
+    fn solvent_water_under_an_unlisted_name_fails() {
+        let min = with(&waters("XWT", 2));
+        let full = [&min[..], &waters("XWT", 9)].concat();
+        let f = check_solvent(&ste("full.pdb", &full), &ste("minimal.pdb", &min));
+        assert_eq!(solvent_levels(&f), vec![Level::Fail], "{f:?}");
+        assert!(f[0].message.contains("one O and two H"), "{f:?}");
+        assert!(f[0].message.contains("XWT (2)"), "{f:?}");
+    }
+
+    #[test]
+    fn solvent_listed_and_unlisted_water_are_two_failures() {
+        let min = with(&[waters("TIP3", 1), waters("XWT", 1)].concat());
+        let full = [&min[..], &waters("TIP3", 9)].concat();
+        let f = check_solvent(&ste("full.pdb", &full), &ste("minimal.pdb", &min));
+        assert_eq!(solvent_levels(&f), vec![Level::Fail, Level::Fail], "{f:?}");
+        assert!(f[0].message.contains("TIP3 (1)") && !f[0].message.contains("XWT"));
+        assert!(f[1].message.contains("XWT (1)") && !f[1].message.contains("TIP3"));
+    }
+
+    #[test]
+    fn water_shape_is_one_oxygen_and_two_hydrogens() {
+        let res = |e: [&'static str; 3]| -> Vec<Atom> {
+            ste(
+                "x",
+                &[
+                    ("A", "R", 1, e[0]),
+                    ("B", "R", 1, e[1]),
+                    ("C", "R", 1, e[2]),
+                ],
+            )
+            .atoms
+        };
+        assert!(water_shaped(&res(["O", "H", "H"])));
+        assert!(water_shaped(&res(["H", "O", "H"])));
+        assert!(water_shaped(&res(["o", "h", "h"])));
+        assert!(water_shaped(&res(["O", "D", "D"]))); // heavy water
+        assert!(!water_shaped(&res(["C", "O", "H"])));
+        assert!(!water_shaped(&res(["O", "O", "H"])));
+        assert!(!water_shaped(&res(["", "", ""]))); // .psf: no elements
+        // a four-site water (TIP4P's massless site) is not three atoms
+        let tip4 = ste(
+            "x",
+            &[
+                ("O", "R", 1, "O"),
+                ("H1", "R", 1, "H"),
+                ("H2", "R", 1, "H"),
+                ("M", "R", 1, ""),
+            ],
+        );
+        assert!(!water_shaped(&tip4.atoms));
+    }
+
+    #[test]
+    fn solvent_residues_split_like_the_atom_check() {
+        // two waters numbered alike but apart are two residues
+        let atoms = ste(
+            "x",
+            &[
+                ("O", "XWT", 1, "O"),
+                ("H1", "XWT", 1, "H"),
+                ("H2", "XWT", 1, "H"),
+                ("N", "ALA", 2, "N"),
+                ("O", "XWT", 1, "O"),
+                ("H1", "XWT", 1, "H"),
+                ("H2", "XWT", 1, "H"),
+            ],
+        )
+        .atoms;
+        let r = residues(&atoms);
+        assert_eq!(r.iter().map(|x| x.len()).collect::<Vec<_>>(), vec![3, 1, 3]);
+        assert!(residues(&[]).is_empty());
+    }
+
+    #[test]
+    fn solvent_nothing_stripped_warns() {
+        // implicit solvent or vacuum: minimal is full
+        let f =
+            check_solvent(&ste("full.pdb", &PROTEIN), &ste("minimal.pdb", &PROTEIN));
+        assert_eq!(solvent_levels(&f), vec![Level::Warn], "{f:?}");
+        assert!(
+            f[0].message.contains("4 of the 4 atoms of full.pdb (100%)"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn solvent_unlisted_solvent_warns() {
+        // a coarse-grained water bead (one atom) no list names, and an
+        // unlisted lipid: neither is water-shaped, so only the share shows
+        let mut extra: Vec<A> = (0..6).map(|i| ("W", "W", 10 + i, "")).collect();
+        extra.push(("P", "XLIP", 20, "P"));
+        let min = with(&extra);
+        let full = [&min[..], &waters("SOL", 2)].concat();
+        let f = check_solvent(&ste("full.pdb", &full), &ste("minimal.pdb", &min));
+        assert_eq!(solvent_levels(&f), vec![Level::Warn], "{f:?}");
+        assert!(f[0].message.contains("11 of the 17 atoms"), "{f:?}");
+    }
+
+    #[test]
+    fn solvent_share_warns_only_above_half() {
+        let full = ste("full.pdb", &with(&waters("SOL", 2)[..4]));
+        let half = check_solvent(&full, &ste("minimal.pdb", &PROTEIN));
+        assert_eq!(solvent_levels(&half), vec![Level::Info], "{half:?}");
+        let full = ste("full.pdb", &with(&waters("SOL", 1)));
+        let more = check_solvent(&full, &ste("minimal.pdb", &PROTEIN));
+        assert_eq!(solvent_levels(&more), vec![Level::Warn], "{more:?}");
+    }
+
+    #[test]
+    fn solvent_empty_full_says_nothing_wrong() {
+        let f = check_solvent(&ste("full.pdb", &[]), &ste("minimal.pdb", &[]));
+        assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
+    }
+
+    #[test]
+    fn solvent_in_run_checks_from_pdb_files() {
+        // ATOMS ends in a TIP3 water, cpptraj's 4-letter name from column 17
+        let d = tempfile::tempdir().unwrap();
+        write_pdb(&d.path().join("full.pdb"), &ATOMS, &XYZ, None, 1);
+        write_pdb(&d.path().join("minimal.pdb"), &ATOMS, &XYZ, None, 1);
+        let f = run(d.path(), None);
+        assert_eq!(levels(&f, Some("solvent")), vec![fail("minimal.pdb")]);
+        assert!(
+            f.iter()
+                .any(|x| x.check == "solvent" && x.message.contains("TIP3 (1)")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn solvent_reads_elements_from_mmcif() {
+        let d = tempfile::tempdir().unwrap();
+        let min = with(&waters("XWT", 1));
+        let full = [&min[..], &waters("XWT", 9)].concat();
+        let xyz = |n: usize| vec![[1.0, 2.0, 3.0]; n];
+        write_mmcif(&d.path().join("full.mmcif"), &full, &xyz(full.len()));
+        write_mmcif(&d.path().join("minimal.mmcif"), &min, &xyz(min.len()));
+        let f = check_solvent_files(&find_files(d.path()));
+        assert_eq!(solvent_levels(&f), vec![Level::Fail], "{f:?}");
+        assert_eq!(f[0].file, "minimal.mmcif");
+        assert!(f[0].message.contains("XWT (1)"), "{f:?}");
+    }
+
+    #[test]
+    fn solvent_leaves_minimal_lipid_alone() {
+        // minimal_lipid.* keeps its lipids on purpose
+        let d = tempfile::tempdir().unwrap();
+        let lipids: Vec<A> = (0..4).map(|i| ("P", "POPC", 5 + i, "P")).collect();
+        let full = [&with(&lipids)[..], &waters("SOL", 4)].concat();
+        let xyz = |n: usize| vec![[1.0, 2.0, 3.0]; n];
+        write_pdb(&d.path().join("full.pdb"), &full, &xyz(full.len()), None, 1);
+        write_pdb(&d.path().join("minimal.pdb"), &PROTEIN, &xyz(4), None, 1);
+        let ml = with(&lipids);
+        write_pdb(
+            &d.path().join("minimal_lipid.pdb"),
+            &ml,
+            &xyz(ml.len()),
+            None,
+            1,
+        );
+        let f = run(d.path(), None);
+        assert_eq!(levels(&f, Some("solvent")), vec![], "{f:?}");
+    }
+
+    /// Real processed folders: MDR_SOLVENT_BAD kept their water in minimal
+    /// (Zenodo 4501408's staging deposits before simulation-processing#60),
+    /// MDR_SOLVENT_GOOD did not.
+    /// MDR_SOLVENT_BAD=<dir>:<dir> MDR_SOLVENT_GOOD=<dir>:<dir>
+    ///     cargo test -p mdr-process -- --ignored real_solvent
+    #[test]
+    #[ignore = "needs MDR_SOLVENT_BAD and MDR_SOLVENT_GOOD folders"]
+    fn real_solvent_folders() {
+        for d in std::env::var("MDR_SOLVENT_BAD")
+            .expect("MDR_SOLVENT_BAD")
+            .split(':')
+        {
+            let f = check_solvent_files(&find_files(Path::new(d)));
+            assert!(!fails(&f).is_empty(), "{d}: {f:?}");
+        }
+        for d in std::env::var("MDR_SOLVENT_GOOD")
+            .expect("MDR_SOLVENT_GOOD")
+            .split(':')
+        {
+            let f = check_solvent_files(&find_files(Path::new(d)));
             assert!(!f.is_empty() && fails(&f).is_empty(), "{d}: {f:?}");
         }
     }
