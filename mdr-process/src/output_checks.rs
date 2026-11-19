@@ -1117,28 +1117,59 @@ pub fn check_atoms(files: &HashMap<String, PathBuf>, trajs: &[Frames]) -> Vec<Fi
 }
 
 // --- check 4: solute ---------------------------------------------------------------
-/// Residue names `minimal.*` drops on purpose, compared without case: water,
-/// the stripped ions and the lipids (simulation-processing
-/// `cpptraj_gmx_traj_manipulation.py` KNOWN_WATER, KNOWN_IONS, KNOWN_LIPIDS;
-/// the GROMACS path also drops what `residuetypes.dat` calls Water, and
-/// [`crate::sequence::WATER`] names the rest). Every other residue -- a
-/// ligand, a cofactor, a bound Zn2+ or Ca2+ -- belongs in minimal.
-const MINIMAL_DROPS: &[&str] = &[
-    // water
+/// Water names `minimal.*` drops, compared without case (simulation-processing
+/// `cpptraj_gmx_traj_manipulation.py` KNOWN_WATER; the GROMACS path also
+/// drops what `residuetypes.dat` calls Water, which adds OHH and T3H; and
+/// [`crate::sequence::WATER`] names the rest). With [`MINIMAL_IONS`] and
+/// [`MINIMAL_LIPIDS`] this is everything minimal drops on purpose; every
+/// other residue -- a ligand, a cofactor, a bound Zn2+ or Ca2+ -- belongs in
+/// minimal.
+const MINIMAL_WATER: &[&str] = &[
     "WAT", "HOH", "TIP3", "TIP3P", "TIP4", "TIP4P", "TIP5", "OPC", "SPC", "SOL", "OHH",
-    "T3H", // ions
-    "NA", "CL", "K", "SOD", "CLA", "NA+", "CL-", "K+", "MG2+", "MG",
-    // lipids
+    "T3H",
+];
+
+/// The ions simulation-processing strips from minimal, spelled exactly as
+/// its KNOWN_IONS spells them. Its cpptraj masks and `gmx make_ndx` `r`
+/// selections match residue names with their case, so `Mg2+` is stripped
+/// and `MG2+` is kept, like any ion the list does not name (a bound Zn2+ or
+/// Ca2+).
+const MINIMAL_IONS: &[&str] = &[
+    "NA", "CL", "K", "SOD", "CLA", "NA+", "CL-", "K+", "Mg2+", "MG", "Na+", "Cl-",
+];
+
+/// The lipids simulation-processing strips from minimal (KNOWN_LIPIDS),
+/// matched with case like [`MINIMAL_IONS`]
+const MINIMAL_LIPIDS: &[&str] = &[
     "DPPC", "POPC", "POPE", "DOPC", "DLPC", "DMPC", "DSPC", "CHOL",
 ];
 
-/// True for a residue name minimal is meant to drop
-pub fn dropped_from_minimal(resname: &str) -> bool {
-    let r = resname.trim();
-    MINIMAL_DROPS
+fn water_name(r: &str) -> bool {
+    MINIMAL_WATER
         .iter()
         .chain(crate::sequence::WATER)
         .any(|d| d.eq_ignore_ascii_case(r))
+}
+
+/// True for a residue name minimal MAY drop, compared without case. The
+/// lenient reading, for [`check_solute`]: minimal losing one of these is
+/// never a fault.
+pub fn dropped_from_minimal(resname: &str) -> bool {
+    let r = resname.trim();
+    water_name(r)
+        || MINIMAL_IONS
+            .iter()
+            .chain(MINIMAL_LIPIDS)
+            .any(|d| d.eq_ignore_ascii_case(r))
+}
+
+/// True for a residue name minimal MUST NOT keep, for [`check_solvent`]:
+/// water under any case (water left in minimal is always a fault), and the
+/// ions and lipids simulation-processing strips, with their exact case. An
+/// ion or lipid it keeps (`MG2+`, a lower-case `popc`) is not a failure.
+pub fn stripped_from_minimal(resname: &str) -> bool {
+    let r = resname.trim();
+    water_name(r) || MINIMAL_IONS.iter().chain(MINIMAL_LIPIDS).any(|d| *d == r)
 }
 
 /// {residue name: residues of that name}, residues split as
@@ -1276,9 +1307,11 @@ fn name_counts(counts: &std::collections::BTreeMap<String, usize>) -> String {
 /// KNOWN_WATER did not have it (simulation-processing#59, fixed in #60).
 /// Nothing caught it until the viewer showed the protein buried in solvent.
 ///
-/// - FAIL: a residue [`dropped_from_minimal`] names. Those lists are kept
-///   apart from simulation-processing's, so this fails when the two
-///   disagree on a name a record uses.
+/// - FAIL: a residue [`stripped_from_minimal`] names: water under any
+///   case, or an ion or lipid simulation-processing strips, with its exact
+///   case (it keeps `MG2+` and strips `Mg2+`). Those lists are kept apart
+///   from simulation-processing's; the ignored test
+///   `strip_lists_match_simulation_processing` compares them.
 /// - FAIL: a residue of one O and two H, water under a name neither list
 ///   has (needs elements, so not from a .psf pair).
 /// - WARN, when neither failed: minimal keeps more than
@@ -1294,7 +1327,7 @@ pub fn check_solvent(full: &Structure, minimal: &Structure) -> Vec<Finding> {
     );
     for res in residues(&minimal.atoms) {
         let name = res[0].resname.clone();
-        if dropped_from_minimal(&name) {
+        if stripped_from_minimal(&name) {
             *listed.entry(name).or_insert(0) += 1;
         } else if water_shaped(res) {
             *shaped.entry(name).or_insert(0) += 1;
@@ -2877,7 +2910,12 @@ mod tests {
 
     #[test]
     fn solvent_every_dropped_name_fails() {
-        for name in MINIMAL_DROPS.iter().chain(crate::sequence::WATER) {
+        for name in MINIMAL_WATER
+            .iter()
+            .chain(MINIMAL_IONS)
+            .chain(MINIMAL_LIPIDS)
+            .chain(crate::sequence::WATER)
+        {
             let min = ste("minimal.pdb", &with(&[("X", name, 9, "")]));
             let f = check_solvent(&ste("full.pdb", &with(&waters("SOL", 9))), &min);
             assert!(
@@ -2901,6 +2939,120 @@ mod tests {
         let full = ste("full.pdb", &with(&[&keep[..], &waters("WAT", 9)].concat()));
         let f = check_solvent(&full, &ste("minimal.pdb", &with(&keep)));
         assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
+    }
+
+    /// The solvent findings for a minimal of the protein plus one atom of
+    /// residue `name` (no element, so only the name can fail it), against a
+    /// full system with water so the share never warns
+    fn solvent_one_residue(name: &'static str) -> Vec<Finding> {
+        let min = ste("minimal.pdb", &with(&[("X", name, 9, "")]));
+        check_solvent(&ste("full.pdb", &with(&waters("SOL", 9))), &min)
+    }
+
+    #[test]
+    fn solvent_ions_match_with_case_like_simulation_processing() {
+        // stripped by simulation-processing, so a failure when kept
+        for name in [
+            "Mg2+", "MG", "NA", "Na+", "NA+", "CL", "Cl-", "CL-", "K", "K+",
+        ] {
+            let f = solvent_one_residue(name);
+            assert_eq!(fails(&f).len(), 1, "{name}: {f:?}");
+            assert!(f[0].message.contains(&format!("{name} (1)")), "{f:?}");
+        }
+        // kept by simulation-processing (cpptraj and make_ndx match case)
+        for name in ["MG2+", "mg", "na+", "Na", "ZN", "Ca2+"] {
+            let f = solvent_one_residue(name);
+            assert!(fails(&f).is_empty(), "{name}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn solvent_lipids_match_with_case() {
+        assert_eq!(fails(&solvent_one_residue("POPC")).len(), 1);
+        assert_eq!(fails(&solvent_one_residue("CHOL")).len(), 1);
+        assert!(fails(&solvent_one_residue("popc")).is_empty());
+        assert!(fails(&solvent_one_residue("Chol")).is_empty());
+    }
+
+    #[test]
+    fn solvent_water_names_fail_in_any_case() {
+        // water left in minimal is a fault whatever its case or path; OHH and
+        // T3H only the GROMACS path strips, and they still fail elsewhere
+        for name in [
+            "sol", "Wat", "hoh", "T3P", "t3p", "OHH", "T3H", "tip3p", "SPCE",
+        ] {
+            let f = solvent_one_residue(name);
+            assert_eq!(fails(&f).len(), 1, "{name}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn solute_still_lets_minimal_drop_any_case() {
+        // the lenient reading is unchanged: minimal dropping these is fine
+        for name in ["MG2+", "Mg2+", "mg2+", "popc", "na+", "Cl-", "sol", " OHH "] {
+            assert!(dropped_from_minimal(name), "{name}");
+        }
+        for name in ["MG2+", "popc", "na+", "ZN", "MOL"] {
+            assert!(!stripped_from_minimal(name), "{name}");
+        }
+        assert!(!dropped_from_minimal("ZN") && !dropped_from_minimal("MOL"));
+    }
+
+    #[test]
+    fn solvent_stripped_names_are_a_subset_of_dropped() {
+        for name in MINIMAL_WATER
+            .iter()
+            .chain(MINIMAL_IONS)
+            .chain(MINIMAL_LIPIDS)
+            .chain(crate::sequence::WATER)
+        {
+            assert!(stripped_from_minimal(name), "{name}");
+            assert!(dropped_from_minimal(name), "{name}");
+        }
+    }
+
+    /// The quoted names in a Python list `NAME = [ ... ]` in `text`
+    fn python_list(text: &str, name: &str) -> Vec<String> {
+        let start = text
+            .find(&format!("\n{name} = ["))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let body = &text[start..];
+        let body = &body[body.find('[').unwrap() + 1..body.find(']').unwrap()];
+        body.lines()
+            .map(|l| l.split('#').next().unwrap())
+            .flat_map(|l| l.split(','))
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "needs a simulation-processing checkout: MDR_SIMPROC_DIR"]
+    fn strip_lists_match_simulation_processing() {
+        let dir = std::env::var("MDR_SIMPROC_DIR").expect("MDR_SIMPROC_DIR");
+        let path = Path::new(&dir).join("python/cpptraj_gmx_traj_manipulation.py");
+        let text = fs::read_to_string(&path).expect("read the strip lists");
+        let sorted = |v: Vec<String>| {
+            let mut v = v;
+            v.sort();
+            v
+        };
+        let ours = |l: &[&str]| sorted(l.iter().map(|s| s.to_string()).collect());
+        assert_eq!(sorted(python_list(&text, "KNOWN_IONS")), ours(MINIMAL_IONS));
+        assert_eq!(
+            sorted(python_list(&text, "KNOWN_LIPIDS")),
+            ours(MINIMAL_LIPIDS)
+        );
+        for name in python_list(&text, "KNOWN_WATER") {
+            assert!(water_name(&name), "KNOWN_WATER {name} is not water here");
+        }
+    }
+
+    #[test]
+    fn python_list_reads_names_and_skips_comments() {
+        let text =
+            "x\nKNOWN_IONS = [\n    \"NA\",\n    \"Mg2+\",  # Amber\n    \"Cl-\",\n]\n";
+        assert_eq!(python_list(text, "KNOWN_IONS"), vec!["NA", "Mg2+", "Cl-"]);
     }
 
     #[test]

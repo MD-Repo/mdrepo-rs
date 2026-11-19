@@ -19,10 +19,17 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   221,089 atoms) because Desmond names TIP3P `T3P` and simulation-processing's
   `KNOWN_WATER` did not have it (simulation-processing#59, fixed in #60).
   Nothing caught it until the viewer showed the protein buried in solvent.
-  - FAIL when minimal holds a residue `dropped_from_minimal` names (water,
-    the stripped ions, lipids; `MINIMAL_DROPS` and `sequence::WATER`). The
-    strip names live in two places, simulation-processing's `KNOWN_*` lists
-    and these, and this fails when they disagree on a name a record uses.
+  - FAIL when minimal holds a residue `stripped_from_minimal` names: water
+    under any case (`MINIMAL_WATER` and `sequence::WATER`; water left in
+    minimal is always a fault, so OHH and T3H, which only the GROMACS path
+    strips, fail on every path), or an ion or lipid simulation-processing
+    strips, with its exact case (`MINIMAL_IONS`, `MINIMAL_LIPIDS` = its
+    `KNOWN_IONS`, `KNOWN_LIPIDS`). cpptraj masks and `gmx make_ndx` match
+    residue names with case, so `Mg2+` is stripped and `MG2+` kept; the
+    check follows, so a kept `MG2+` is not a failure. The ignored test
+    `strip_lists_match_simulation_processing` (MDR_SIMPROC_DIR) compares
+    the lists. `dropped_from_minimal`, the `solute` check's lenient reading,
+    still ignores case.
   - FAIL when minimal holds a residue of three atoms, one O and two H (or
     D) by element: water under a name no list has. A .psf pair gives no
     elements, so this needs the .pdb or .mmcif pair.
