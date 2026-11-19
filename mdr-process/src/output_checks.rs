@@ -1257,10 +1257,11 @@ pub fn check_solute_files(files: &HashMap<String, PathBuf>) -> Vec<Finding> {
 
 // --- check 5: solvent -------------------------------------------------------------
 /// A minimal holding more than this share of full's atoms is reported (a
-/// warning). In an explicit-solvent run the water alone is most of the
-/// atoms: MDR00004692's minimal kept 190,491 of 221,089 (86%) with its
-/// water left in. An implicit-solvent or vacuum run has nothing to strip
-/// and keeps all of them, so this cannot fail.
+/// warning), when full holds something to strip. In an explicit-solvent run
+/// the water alone is most of the atoms: MDR00004692's minimal kept 190,491
+/// of 221,089 (86%) with its water left in. A run with nothing to strip
+/// (implicit solvent, vacuum, a deposit stripped before upload) keeps all
+/// of them and is not reported.
 pub const MINIMAL_SHARE_WARN: f64 = 0.5;
 
 /// Each residue's atoms, residues split as [`residue_starts`] splits them
@@ -1314,10 +1315,16 @@ fn name_counts(counts: &std::collections::BTreeMap<String, usize>) -> String {
 ///   `strip_lists_match_simulation_processing` compares them.
 /// - FAIL: a residue of one O and two H, water under a name neither list
 ///   has (needs elements, so not from a .psf pair).
-/// - WARN, when neither failed: minimal keeps more than
-///   [`MINIMAL_SHARE_WARN`] of full's atoms, which is how solvent or
-///   lipids under a name no list has would show; or an implicit-solvent
-///   or vacuum run, which is why it only warns.
+/// - WARN, when neither failed: full holds something to strip (a residue
+///   [`stripped_from_minimal`] names, or a water-shaped one), and minimal
+///   still keeps more than [`MINIMAL_SHARE_WARN`] of full's atoms, which
+///   is how solvent or lipids under a name no list has would show. It only
+///   warns because the share is a guess. A full with nothing to strip
+///   (implicit solvent, vacuum, a deposit stripped before upload; DDD and
+///   PLAS-20K all are) is not reported: minimal is rightly all of it. The
+///   cost: a full whose only solvent is under names no list has, and not
+///   water-shaped (an unlisted lipid or organic solvent), is not reported
+///   either.
 ///
 /// minimal_lipid.* keeps lipids on purpose and is not read here.
 pub fn check_solvent(full: &Structure, minimal: &Structure) -> Vec<Finding> {
@@ -1359,23 +1366,39 @@ pub fn check_solvent(full: &Structure, minimal: &Structure) -> Vec<Finding> {
         ));
     }
     let (n_min, n_full) = (minimal.atoms.len(), full.atoms.len());
+    // One pass over full, already in memory: is there anything to strip?
+    let full_has_solvent = residues(&full.atoms)
+        .iter()
+        .any(|res| stripped_from_minimal(&res[0].resname) || water_shaped(res));
     let share = if n_full == 0 {
         0.0
     } else {
         n_min as f64 / n_full as f64
     };
-    if out.is_empty() && share > MINIMAL_SHARE_WARN {
+    if out.is_empty() && full_has_solvent && share > MINIMAL_SHARE_WARN {
         out.push(finding(
             "solvent",
             Level::Warn,
             &minimal.name,
             format!(
-                "keeps {n_min} of the {n_full} atoms of {} ({:.0}%): expected \
-                of an implicit-solvent or vacuum run, which has nothing to \
-                strip; otherwise solvent or lipids under names the strip lists \
-                do not have",
+                "keeps {n_min} of the {n_full} atoms of {} ({:.0}%) though \
+                {} holds water, ions or lipids to strip: solvent or lipids \
+                under names the strip lists do not have?",
                 full.name,
-                100.0 * share
+                100.0 * share,
+                full.name
+            ),
+        ));
+    }
+    if out.is_empty() && !full_has_solvent && n_full > 0 {
+        out.push(finding(
+            "solvent",
+            Level::Info,
+            &minimal.name,
+            format!(
+                "nothing to strip: {} holds no water, stripped ion or lipid \
+                ({n_min} of its {n_full} atoms kept)",
+                full.name
             ),
         ));
     }
@@ -3130,15 +3153,69 @@ mod tests {
     }
 
     #[test]
-    fn solvent_nothing_stripped_warns() {
-        // implicit solvent or vacuum: minimal is full
+    fn solvent_nothing_to_strip_is_info() {
+        // implicit solvent or vacuum: minimal is full, and rightly so
         let f =
             check_solvent(&ste("full.pdb", &PROTEIN), &ste("minimal.pdb", &PROTEIN));
-        assert_eq!(solvent_levels(&f), vec![Level::Warn], "{f:?}");
-        assert!(
-            f[0].message.contains("4 of the 4 atoms of full.pdb (100%)"),
-            "{f:?}"
-        );
+        assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
+        assert!(f[0].message.contains("nothing to strip"), "{f:?}");
+        assert!(f[0].message.contains("4 of its 4 atoms kept"), "{f:?}");
+    }
+
+    #[test]
+    fn solvent_prestripped_deposit_with_ligand_and_ions_is_info() {
+        // DDD / PLAS-20K shape: full arrives stripped, keeps a ligand and a
+        // bound Zn2+ (and an MG2+ simulation-processing keeps)
+        let keep = [
+            ("C1", "MOL", 7, "C"),
+            ("O1", "MOL", 7, "O"),
+            ("ZN", "ZN", 8, "Zn"),
+            ("MG", "MG2+", 9, "Mg"),
+        ];
+        let all = with(&keep);
+        let f = check_solvent(&ste("full.pdb", &all), &ste("minimal.pdb", &all));
+        assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
+        assert!(f[0].message.contains("nothing to strip"), "{f:?}");
+    }
+
+    #[test]
+    fn solvent_full_with_only_unlisted_solvent_is_not_reported() {
+        // the cost of not warning on a full with nothing to strip: beads and
+        // a lower-case lipid no list names go by unreported
+        let mut extra: Vec<A> = (0..6).map(|i| ("W", "W", 10 + i, "")).collect();
+        extra.push(("P", "popc", 20, "P"));
+        let all = with(&extra);
+        let f = check_solvent(&ste("full.pdb", &all), &ste("minimal.pdb", &all));
+        assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
+    }
+
+    #[test]
+    fn solvent_any_strippable_residue_in_full_arms_the_warning() {
+        // one stripped ion, a listed lipid, or one water-shaped residue under
+        // an unlisted name each make full "has something to strip"
+        let beads: Vec<A> = (0..6).map(|i| ("W", "W", 30 + i, "")).collect();
+        let min = with(&beads);
+        for strip in [
+            vec![("NA", "NA", 40, "Na")],
+            vec![("P", "POPC", 40, "P")],
+            waters("XWT", 1),
+        ] {
+            let full = [&min[..], &strip[..]].concat();
+            let f = check_solvent(&ste("full.pdb", &full), &ste("minimal.pdb", &min));
+            assert_eq!(solvent_levels(&f), vec![Level::Warn], "{strip:?}: {f:?}");
+            assert!(
+                f[0].message.contains("holds water, ions or lipids"),
+                "{f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn solvent_kept_mg2_in_full_does_not_arm_the_warning() {
+        // MG2+ is kept by simulation-processing, so it is not "to strip"
+        let all = with(&[("MG", "MG2+", 9, "Mg")]);
+        let f = check_solvent(&ste("full.pdb", &all), &ste("minimal.pdb", &all));
+        assert_eq!(solvent_levels(&f), vec![Level::Info], "{f:?}");
     }
 
     #[test]

@@ -11,6 +11,19 @@ Bump the version in `mdr-process/Cargo.toml` in the same PR as the change:
   database or iRODS, or in its command line;
 - **patch** (0.2.0 -> 0.2.1) for everything else.
 
+## 0.42.1 (unreleased)
+
+- **The `solvent` check's share warning needs something to strip in
+  full.** It warned whenever minimal kept more than half of full's atoms,
+  so every deposit with no solvent in full got it: all 250 DDD and
+  PLAS-20K folders tested on 2026-11-19 (minimal = full, 100%), and the
+  warning reaches the submitter. Now it warns only when full holds a
+  residue `stripped_from_minimal` names or a water-shaped one; otherwise an
+  info line says there was nothing to strip. The cost: a full whose only
+  solvent is under unlisted, non-water-shaped names (an unlisted lipid or
+  organic solvent) is no longer reported. One extra pass over full's
+  residues, already in memory; no file is read again.
+
 ## 0.42.0 (unreleased)
 
 - **New output check, `solvent`: minimal must keep none of what it is meant
